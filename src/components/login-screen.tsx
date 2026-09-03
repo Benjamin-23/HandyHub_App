@@ -8,14 +8,14 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
-  Text,
   TextInput,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { Text } from '@/components/app-text';
 import { SERVICE_CATEGORY_LABELS } from '@/constants/categories';
-import { C } from '@/constants/handyhub-theme';
+import { C, NO_WEB_OUTLINE } from '@/constants/handyhub-theme';
 import { useAuth, type AuthRole } from '@/hooks/use-auth';
 
 type AuthMode = 'signIn' | 'signUp';
@@ -435,8 +435,8 @@ const styles = StyleSheet.create({
   otpSentNote: { color: C.muted, fontSize: 11.5, marginBottom: 8 },
   field: { marginBottom: 14 },
   fieldLabel: { color: C.muted, fontWeight: '700', fontSize: 11, marginBottom: 6, textTransform: 'uppercase', letterSpacing: 0.4 },
-  inputRow: { flexDirection: 'row', alignItems: 'center', gap: 10, height: 48, borderWidth: 1, borderColor: C.line, borderRadius: 13, paddingHorizontal: 13, backgroundColor: C.cream },
-  input: { flex: 1, color: C.ink, fontSize: 14, paddingVertical: 0 },
+  inputRow: { flexDirection: 'row', alignItems: 'center', gap: 10, height: 48, borderRadius: 13, paddingHorizontal: 13, backgroundColor: C.cream },
+  input: { flex: 1, color: C.ink, fontSize: 14, paddingVertical: 0, ...NO_WEB_OUTLINE },
   skillsWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   skillChip: { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 10, borderWidth: 1, borderColor: C.line, backgroundColor: C.cream },
   skillChipActive: { backgroundColor: C.brand, borderColor: C.brand },

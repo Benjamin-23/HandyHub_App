@@ -19,6 +19,7 @@ export type Profile = {
   idVerificationStatus: IdVerificationStatus;
   referralCode?: string;
   recruitedBy?: string;
+  assignedAgentId?: string;
   agentActive: boolean;
 };
 
@@ -36,6 +37,7 @@ type ProfileRow = {
   id_verification_status: IdVerificationStatus;
   referral_code: string | null;
   recruited_by: string | null;
+  assigned_agent_id: string | null;
   agent_active: boolean;
 };
 
@@ -54,6 +56,7 @@ function fromRow(row: ProfileRow): Profile {
     idVerificationStatus: row.id_verification_status,
     referralCode: row.referral_code ?? undefined,
     recruitedBy: row.recruited_by ?? undefined,
+    assignedAgentId: row.assigned_agent_id ?? undefined,
     agentActive: row.agent_active,
   };
 }
@@ -92,7 +95,10 @@ export async function updateProfile(userId: string, update: ProfileUpdate): Prom
 }
 
 export async function fetchRecruits(agentId: string): Promise<Profile[]> {
-  const { data, error } = await supabase.from('profiles').select('*').eq('recruited_by', agentId);
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('*')
+    .or(`recruited_by.eq.${agentId},assigned_agent_id.eq.${agentId}`);
   if (error) throw error;
   return (data as ProfileRow[]).map(fromRow);
 }

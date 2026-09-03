@@ -1,0 +1,16 @@
+import { readFileSync } from 'node:fs';
+import { Client } from 'pg';
+
+const sql = readFileSync(process.argv[2], 'utf8');
+const client = new Client({ connectionString: process.env.SUPABASE_DB_URL, ssl: { rejectUnauthorized: false } });
+
+try {
+  await client.connect();
+  await client.query(sql);
+  console.log('OK: schema applied successfully.');
+} catch (err) {
+  console.error('FAILED:', err.message);
+  process.exitCode = 1;
+} finally {
+  await client.end();
+}

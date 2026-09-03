@@ -639,11 +639,12 @@ $$;
 
 grant execute on function public.get_job_counterpart_phone(uuid) to authenticated;
 
--- Widen the notifications kind check for the two new kinds section 16 adds
--- (the table already existed, so the inline check above never re-applies).
-alter table public.notifications drop constraint if exists notifications_kind_check;
-alter table public.notifications add constraint notifications_kind_check
-  check (kind in ('new_job', 'price_changed', 'job_accepted', 'job_completed', 'schedule_changed', 'job_rated'));
+-- section 16's schedule_changed/job_rated kinds are already covered by the
+-- inline check at table creation above, and section 19 further down widens
+-- it to the full current list — no separate step needed here, since redoing
+-- a narrower version of that check here would reject real rows once the
+-- later kinds are in use (it validates immediately against existing data,
+-- not just from this point in the script forward).
 
 -- 16. Rescheduling an active job, and rating a completed one.
 -- Whoever changes the time is recorded; a change by the worker needs the
@@ -853,6 +854,294 @@ create or replace trigger jobs_lock_payment_method_trigger
 before update on public.jobs
 for each row execute function public.jobs_lock_payment_method();
 
+-- 19. Agent-assisted customers. An agent can help a customer who either
+--     organically signed up with their referral code (recruited_by) or was
+--     manually linked to them by an operator (assigned_agent_id — for a
+--     customer who wants an agent's help but wasn't referred; there's no
+--     self-serve admin UI for this yet, an operator sets it directly, same
+--     as agent activation below). Either way, the agent can see that
+--     customer's jobs and suggest a matching worker — they never touch the
+--     job itself, so the normal customer/worker booking flow is untouched.
+alter table public.profiles add column if not exists assigned_agent_id uuid references public.profiles(id);
+create index if not exists profiles_assigned_agent_id_idx on public.profiles (assigned_agent_id);
+
+drop policy if exists "profiles_select_assigned" on public.profiles;
+create policy "profiles_select_assigned"
+  on public.profiles for select
+  using (assigned_agent_id = auth.uid());
+
+drop policy if exists "jobs_select_agent_customers" on public.jobs;
+create policy "jobs_select_agent_customers"
+  on public.jobs for select
+  using (
+    exists (
+      select 1 from public.profiles c
+      where c.id = jobs.customer_id
+        and (c.recruited_by = auth.uid() or c.assigned_agent_id = auth.uid())
+    )
+  );
+
+-- Widen the notifications kind check for the two new kinds this section adds.
+alter table public.notifications drop constraint if exists notifications_kind_check;
+alter table public.notifications add constraint notifications_kind_check
+  check (kind in (
+    'new_job', 'price_changed', 'job_accepted', 'job_completed', 'schedule_changed', 'job_rated',
+    'referred_customer_job', 'agent_suggestion'
+  ));
+
+-- When a referred/assigned customer posts a job, let their agent(s) know —
+-- the job itself still behaves exactly as it would otherwise (open to
+-- matching workers, or targeted at whoever the customer booked directly).
+create or replace function public.jobs_notify_agent()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_customer public.profiles;
+begin
+  select * into v_customer from public.profiles where id = new.customer_id;
+
+  if v_customer.recruited_by is not null then
+    insert into public.notifications (user_id, job_id, kind, title, body)
+    values (
+      v_customer.recruited_by, new.id, 'referred_customer_job', 'Your referred customer posted a job',
+      new.service || ' — KSh ' || coalesce(new.current_offer::text, new.listed_price::text, '?')
+    );
+  end if;
+
+  if v_customer.assigned_agent_id is not null and v_customer.assigned_agent_id is distinct from v_customer.recruited_by then
+    insert into public.notifications (user_id, job_id, kind, title, body)
+    values (
+      v_customer.assigned_agent_id, new.id, 'referred_customer_job', 'Your assigned customer posted a job',
+      new.service || ' — KSh ' || coalesce(new.current_offer::text, new.listed_price::text, '?')
+    );
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace trigger jobs_notify_agent_trigger
+after insert on public.jobs
+for each row execute function public.jobs_notify_agent();
+
+-- The agent picks a matching worker and suggests them to the customer — this
+-- only ever sends a notification, it never touches the job row itself.
+create or replace function public.suggest_worker_for_job(p_job_id uuid, p_worker_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_job public.jobs;
+  v_is_agent boolean;
+  v_worker_name text;
+  v_agent_name text;
+begin
+  select * into v_job from public.jobs where id = p_job_id;
+  if v_job.id is null then
+    raise exception 'Job not found';
+  end if;
+
+  select exists (
+    select 1 from public.profiles c
+    where c.id = v_job.customer_id
+      and (c.recruited_by = auth.uid() or c.assigned_agent_id = auth.uid())
+  ) into v_is_agent;
+  if not v_is_agent then
+    raise exception 'You are not this customer''s agent';
+  end if;
+
+  select name into v_worker_name from public.profiles where id = p_worker_id and role = 'worker';
+  if v_worker_name is null then
+    raise exception 'Worker not found';
+  end if;
+
+  select name into v_agent_name from public.profiles where id = auth.uid();
+
+  insert into public.notifications (user_id, job_id, kind, title, body)
+  values (
+    v_job.customer_id, v_job.id, 'agent_suggestion', 'Your agent suggests a pro',
+    coalesce(v_agent_name, 'Your agent') || ' recommends ' || v_worker_name || ' for ' || v_job.service
+  );
+end;
+$$;
+
+grant execute on function public.suggest_worker_for_job(uuid, uuid) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Manual step: assigning a customer to an agent (no self-serve admin UI
+-- yet — until one exists, an operator links them directly):
+--
+--   update public.profiles
+--   set assigned_agent_id = '<agent-profile-id>'
+--   where id = '<customer-profile-id>';
+--
+-- To unassign: set assigned_agent_id = null.
+-- ---------------------------------------------------------------------------
+
+-- 20. Two follow-ups from real use: (a) once an agent suggests a worker, the
+--     customer and that worker should both see the job reflect it while it's
+--     still open — not just a one-off notification — so record who was
+--     suggested right on the job row. This is still just a label: the agent
+--     never sets worker_id or status, the normal open-marketplace flow is
+--     untouched, and either side can ignore the suggestion entirely.
+--     (b) a scheduled date/time — on posting a job or rescheduling one —
+--     must be in the future; enforced here too so a stale client can't
+--     backdate one past the UI's own guard.
+alter table public.jobs add column if not exists suggested_worker_id uuid references public.profiles(id);
+create index if not exists jobs_suggested_worker_id_idx on public.jobs (suggested_worker_id);
+
+-- Extends section 19's version with the one extra line: record the
+-- suggestion on the job itself, in addition to notifying the customer.
+create or replace function public.suggest_worker_for_job(p_job_id uuid, p_worker_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_job public.jobs;
+  v_is_agent boolean;
+  v_worker_name text;
+  v_agent_name text;
+begin
+  select * into v_job from public.jobs where id = p_job_id;
+  if v_job.id is null then
+    raise exception 'Job not found';
+  end if;
+
+  select exists (
+    select 1 from public.profiles c
+    where c.id = v_job.customer_id
+      and (c.recruited_by = auth.uid() or c.assigned_agent_id = auth.uid())
+  ) into v_is_agent;
+  if not v_is_agent then
+    raise exception 'You are not this customer''s agent';
+  end if;
+
+  select name into v_worker_name from public.profiles where id = p_worker_id and role = 'worker';
+  if v_worker_name is null then
+    raise exception 'Worker not found';
+  end if;
+
+  select name into v_agent_name from public.profiles where id = auth.uid();
+
+  update public.jobs set suggested_worker_id = p_worker_id where id = p_job_id;
+
+  insert into public.notifications (user_id, job_id, kind, title, body)
+  values (
+    v_job.customer_id, v_job.id, 'agent_suggestion', 'Your agent suggests a pro',
+    coalesce(v_agent_name, 'Your agent') || ' recommends ' || v_worker_name || ' for ' || v_job.service
+  );
+end;
+$$;
+
+grant execute on function public.suggest_worker_for_job(uuid, uuid) to authenticated;
+
+create or replace function public.jobs_validate_schedule()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.scheduled_at is not null
+     and (tg_op = 'INSERT' or new.scheduled_at is distinct from old.scheduled_at)
+     and new.scheduled_at <= now() then
+    raise exception 'Scheduled time must be in the future.';
+  end if;
+  return new;
+end;
+$$;
+
+create or replace trigger jobs_validate_schedule_trigger
+before insert or update on public.jobs
+for each row execute function public.jobs_validate_schedule();
+
+-- 21. An agent can post a job directly on behalf of one of their customers
+--     (referred or admin-assigned) — same open-marketplace flow as if the
+--     customer posted it themselves (any matching worker can pick it up and
+--     negotiate); the agent still never sets worker_id or status after the
+--     fact, only suggest_worker_for_job() (section 19/20) can nudge it once
+--     it exists. Also: an agent shouldn't get a "your customer posted a job"
+--     notification for a job they just posted themselves.
+create or replace function public.create_job_for_customer(
+  p_customer_id uuid,
+  p_category text,
+  p_service text,
+  p_pay_type public.job_pay_type,
+  p_offer numeric,
+  p_location text default null,
+  p_scheduled_at timestamptz default null
+)
+returns public.jobs
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_is_agent boolean;
+  v_job public.jobs;
+begin
+  select exists (
+    select 1 from public.profiles c
+    where c.id = p_customer_id
+      and c.role = 'customer'
+      and (c.recruited_by = auth.uid() or c.assigned_agent_id = auth.uid())
+  ) into v_is_agent;
+  if not v_is_agent then
+    raise exception 'You are not this customer''s agent';
+  end if;
+
+  insert into public.jobs (customer_id, category, service, pay_type, location, scheduled_at, listed_price, current_offer, offer_by, status)
+  values (p_customer_id, p_category, p_service, p_pay_type, p_location, p_scheduled_at, p_offer, p_offer, 'customer', 'open')
+  returning * into v_job;
+
+  return v_job;
+end;
+$$;
+
+grant execute on function public.create_job_for_customer(uuid, text, text, public.job_pay_type, numeric, text, timestamptz) to authenticated;
+
+-- Redefine section 19's version: skip notifying whichever agent relationship
+-- is the one that just created this job themselves (auth.uid() is that
+-- agent for a create_job_for_customer() call; for a normal customer-posted
+-- job auth.uid() is the customer, which never matches an agent's id here).
+create or replace function public.jobs_notify_agent()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_customer public.profiles;
+begin
+  select * into v_customer from public.profiles where id = new.customer_id;
+
+  if v_customer.recruited_by is not null and v_customer.recruited_by is distinct from auth.uid() then
+    insert into public.notifications (user_id, job_id, kind, title, body)
+    values (
+      v_customer.recruited_by, new.id, 'referred_customer_job', 'Your referred customer posted a job',
+      new.service || ' — KSh ' || coalesce(new.current_offer::text, new.listed_price::text, '?')
+    );
+  end if;
+
+  if v_customer.assigned_agent_id is not null
+     and v_customer.assigned_agent_id is distinct from v_customer.recruited_by
+     and v_customer.assigned_agent_id is distinct from auth.uid() then
+    insert into public.notifications (user_id, job_id, kind, title, body)
+    values (
+      v_customer.assigned_agent_id, new.id, 'referred_customer_job', 'Your assigned customer posted a job',
+      new.service || ' — KSh ' || coalesce(new.current_offer::text, new.listed_price::text, '?')
+    );
+  end if;
+
+  return new;
+end;
+$$;
+
 -- ---------------------------------------------------------------------------
 -- Manual step: creating/activating an agent (no self-serve sign-up yet).
 -- Have them sign up as a customer or worker first (so auth + a base profile
@@ -867,3 +1156,277 @@ for each row execute function public.jobs_lock_payment_method();
 -- To deactivate an agent again: set agent_active = false (their recruits and
 -- referral code stay intact).
 -- ---------------------------------------------------------------------------
+
+-- 22. Category rename: "Moving" -> "Driver". One-off data fix so existing
+--     rows keep matching after the constants-file rename.
+update public.jobs set category = 'Driver' where category = 'Moving';
+update public.profiles set skills = array_replace(skills, 'Moving', 'Driver') where 'Moving' = any(skills);
+
+-- 23. A customer can attach a photo of the issue when posting a job, so a
+--     worker can see what they're quoting on before they commit. Kept small
+--     client-side (resized before upload) and deleted once the job is done —
+--     see jobs_cleanup_photo() below, the concrete "not stored for long".
+alter table public.jobs add column if not exists photo_path text;
+grant update (photo_path) on public.jobs to authenticated;
+
+insert into storage.buckets (id, name, public)
+values ('job-photos', 'job-photos', false)
+on conflict (id) do nothing;
+
+-- Only the job's own customer can attach its photo.
+drop policy if exists "job_photos_insert_customer" on storage.objects;
+create policy "job_photos_insert_customer"
+  on storage.objects for insert
+  with check (
+    bucket_id = 'job-photos'
+    and exists (
+      select 1 from public.jobs j
+      where j.id::text = (storage.foldername(name))[1] and j.customer_id = auth.uid()
+    )
+  );
+
+-- Anyone who can already see the job (matched participant, or a worker whose
+-- skills match it while it's still open) can see its photo too.
+drop policy if exists "job_photos_select_participant" on storage.objects;
+create policy "job_photos_select_participant"
+  on storage.objects for select
+  using (
+    bucket_id = 'job-photos'
+    and exists (
+      select 1 from public.jobs j
+      where j.id::text = (storage.foldername(name))[1]
+        and (
+          j.customer_id = auth.uid()
+          or j.worker_id = auth.uid()
+          or (
+            j.status = 'open'
+            and exists (
+              select 1 from public.profiles p
+              where p.id = auth.uid() and p.role = 'worker' and j.category = any(p.skills)
+            )
+          )
+        )
+    )
+  );
+
+-- Deleting the stored photo needs elevated rights (see jobs_cleanup_photo()
+-- below, security definer) rather than a client-facing delete policy.
+create or replace function public.jobs_cleanup_photo()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if new.status in ('completed', 'cancelled') and old.status is distinct from new.status and new.photo_path is not null then
+    delete from storage.objects where bucket_id = 'job-photos' and name = new.photo_path;
+    new.photo_path := null;
+  end if;
+  return new;
+end;
+$$;
+
+create or replace trigger jobs_cleanup_photo_trigger
+before update on public.jobs
+for each row execute function public.jobs_cleanup_photo();
+
+-- 24. Multiple workers negotiating one open job in parallel. Previously a
+--     job had a single worker_id/current_offer pair, so the first worker to
+--     claim an open job locked everyone else out. Now, for the open
+--     marketplace flow (no specific worker booked at posting), each matching
+--     worker gets their own negotiation thread here while jobs.status stays
+--     'open' — the customer sees every active thread and picks one via
+--     accept_job_offer() below, at which point the job matches normally
+--     (worker_id/status/final_price on jobs) and every other thread is
+--     declined. Direct bookings (postJob with a specific workerId) are
+--     unaffected — those still negotiate straight on the jobs row as before.
+create table if not exists public.job_offers (
+  id uuid primary key default gen_random_uuid(),
+  job_id uuid not null references public.jobs(id) on delete cascade,
+  worker_id uuid not null references public.profiles(id) on delete cascade,
+  current_offer numeric not null,
+  offer_by public.job_offer_by not null,
+  status text not null default 'active' check (status in ('active', 'accepted', 'declined')),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (job_id, worker_id)
+);
+
+create index if not exists job_offers_job_id_idx on public.job_offers (job_id);
+create index if not exists job_offers_worker_id_idx on public.job_offers (worker_id);
+
+create or replace trigger job_offers_set_updated_at
+before update on public.job_offers
+for each row execute function public.set_updated_at();
+
+alter table public.job_offers enable row level security;
+
+-- A matching worker opens a thread on a still-open job with their own offer.
+drop policy if exists "job_offers_insert_worker" on public.job_offers;
+create policy "job_offers_insert_worker"
+  on public.job_offers for insert
+  with check (
+    worker_id = auth.uid()
+    and offer_by = 'worker'
+    and exists (
+      select 1 from public.jobs j
+      join public.profiles p on p.id = auth.uid()
+      where j.id = job_id and j.status = 'open' and p.role = 'worker' and j.category = any(p.skills)
+    )
+  );
+
+-- The offering worker or the job's own customer can read that thread.
+drop policy if exists "job_offers_select_participant" on public.job_offers;
+create policy "job_offers_select_participant"
+  on public.job_offers for select
+  using (
+    worker_id = auth.uid()
+    or exists (select 1 from public.jobs j where j.id = job_id and j.customer_id = auth.uid())
+  );
+
+-- Either side can counter while the thread is still active — settling it
+-- (accepted/declined) only ever happens via accept_job_offer() below.
+drop policy if exists "job_offers_update_participant" on public.job_offers;
+create policy "job_offers_update_participant"
+  on public.job_offers for update
+  using (
+    status = 'active'
+    and (
+      worker_id = auth.uid()
+      or exists (select 1 from public.jobs j where j.id = job_id and j.customer_id = auth.uid())
+    )
+  )
+  with check (
+    worker_id = auth.uid()
+    or exists (select 1 from public.jobs j where j.id = job_id and j.customer_id = auth.uid())
+  );
+
+revoke all on public.job_offers from anon, authenticated;
+grant select, insert on public.job_offers to authenticated;
+grant update (current_offer, offer_by) on public.job_offers to authenticated;
+
+-- A customer needs to see the name of every worker negotiating one of their
+-- jobs (not just the one eventually matched), and a worker needs to see the
+-- customer's name on a job they've made an offer on — profiles RLS didn't
+-- cover either case before (only own/recruited/assigned profiles were
+-- readable), which also silently blanked out job.workerName/customerName
+-- for matched jobs. This covers both the matched-job case and job_offers.
+drop policy if exists "profiles_select_job_counterpart" on public.profiles;
+create policy "profiles_select_job_counterpart"
+  on public.profiles for select
+  using (
+    exists (
+      select 1 from public.jobs j
+      where (j.customer_id = auth.uid() and (j.worker_id = profiles.id or j.suggested_worker_id = profiles.id))
+         or (j.worker_id = auth.uid() and j.customer_id = profiles.id)
+    )
+    or exists (
+      select 1 from public.job_offers o
+      join public.jobs j on j.id = o.job_id
+      where (j.customer_id = auth.uid() and o.worker_id = profiles.id)
+         or (o.worker_id = auth.uid() and j.customer_id = profiles.id)
+    )
+  );
+
+-- Notify on a new offer thread, and on every subsequent counter within one —
+-- same shape as jobs_notify_new()/jobs_notify_update() above, just scoped to
+-- one worker's thread instead of the whole job.
+create or replace function public.job_offers_notify()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_job public.jobs;
+begin
+  select * into v_job from public.jobs where id = coalesce(new.job_id, old.job_id);
+
+  if tg_op = 'INSERT' then
+    insert into public.notifications (user_id, job_id, kind, title, body)
+    values (v_job.customer_id, v_job.id, 'new_offer', 'New quote on ' || v_job.service, 'KSh ' || new.current_offer);
+    return new;
+  end if;
+
+  if new.current_offer is distinct from old.current_offer and new.status = 'active' then
+    if new.offer_by = 'worker' then
+      insert into public.notifications (user_id, job_id, kind, title, body)
+      values (v_job.customer_id, v_job.id, 'price_changed', 'New offer on ' || v_job.service, 'Countered at KSh ' || new.current_offer);
+    elsif new.offer_by = 'customer' then
+      insert into public.notifications (user_id, job_id, kind, title, body)
+      values (new.worker_id, v_job.id, 'price_changed', 'New offer on ' || v_job.service, 'Countered at KSh ' || new.current_offer);
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace trigger job_offers_notify_insert_trigger
+after insert on public.job_offers
+for each row execute function public.job_offers_notify();
+
+create or replace trigger job_offers_notify_update_trigger
+after update on public.job_offers
+for each row execute function public.job_offers_notify();
+
+-- 25. The customer picks one of the (possibly several) negotiating workers.
+--     Matches the job normally (worker_id/status/final_price on jobs, which
+--     reuses jobs_generate_completion_code + jobs_notify_update's existing
+--     'job_accepted' notifications for free) and declines every other
+--     still-active thread on that job, notifying each of those workers.
+create or replace function public.accept_job_offer(p_offer_id uuid)
+returns public.jobs
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_offer public.job_offers;
+  v_job public.jobs;
+begin
+  select * into v_offer from public.job_offers where id = p_offer_id;
+  if v_offer.id is null then
+    raise exception 'Offer not found';
+  end if;
+
+  select * into v_job from public.jobs where id = v_offer.job_id;
+  if v_job.customer_id is distinct from auth.uid() then
+    raise exception 'Not your job';
+  end if;
+  if v_job.status is distinct from 'open' then
+    raise exception 'Job is no longer open';
+  end if;
+  if v_offer.status is distinct from 'active' then
+    raise exception 'Offer is no longer active';
+  end if;
+
+  update public.jobs
+  set worker_id = v_offer.worker_id, status = 'accepted', final_price = v_offer.current_offer
+  where id = v_job.id
+  returning * into v_job;
+
+  update public.job_offers set status = 'accepted' where id = v_offer.id;
+
+  update public.job_offers
+  set status = 'declined'
+  where job_id = v_job.id and id <> v_offer.id and status = 'active';
+
+  insert into public.notifications (user_id, job_id, kind, title, body)
+  select o.worker_id, v_job.id, 'offer_declined', 'Job matched with another pro', v_job.service || ' was matched with someone else.'
+  from public.job_offers o
+  where o.job_id = v_job.id and o.id <> v_offer.id and o.status = 'declined';
+
+  return v_job;
+end;
+$$;
+
+grant execute on function public.accept_job_offer(uuid) to authenticated;
+
+-- Widen the notifications kind check for the two new kinds this section adds.
+alter table public.notifications drop constraint if exists notifications_kind_check;
+alter table public.notifications add constraint notifications_kind_check
+  check (kind in (
+    'new_job', 'price_changed', 'job_accepted', 'job_completed', 'schedule_changed', 'job_rated',
+    'referred_customer_job', 'agent_suggestion', 'new_offer', 'offer_declined'
+  ));

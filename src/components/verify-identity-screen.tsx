@@ -2,9 +2,10 @@ import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
 import * as ImagePicker from 'expo-image-picker';
 import { useState } from 'react';
-import { ActivityIndicator, Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Image, Pressable, ScrollView, StyleSheet, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { Text } from '@/components/app-text';
 import { C } from '@/constants/handyhub-theme';
 import { useAuth } from '@/hooks/use-auth';
 import { updateProfile, uploadIdDocument } from '@/lib/profiles';
@@ -171,7 +172,7 @@ const styles = StyleSheet.create({
   typeLabel: { color: C.muted, fontWeight: '700', fontSize: 12.5 },
   typeLabelActive: { color: '#FFFFFF' },
   inputRow: { flexDirection: 'row', alignItems: 'center', gap: 10, height: 48, borderWidth: 1, borderColor: C.line, borderRadius: 13, paddingHorizontal: 13, backgroundColor: C.cream },
-  input: { flex: 1, color: C.ink, fontSize: 14, paddingVertical: 0 },
+  input: { flex: 1, color: C.ink, fontSize: 14, paddingVertical: 0, outlineWidth: 1.5, outlineColor: '#D1D5DB', outlineStyle: 'solid' },
   photoPicker: { minHeight: 120, borderRadius: 13, borderWidth: 1, borderColor: C.line, borderStyle: 'dashed', backgroundColor: C.cream, alignItems: 'center', justifyContent: 'center', gap: 6, overflow: 'hidden' },
   photoPickerText: { color: C.muted, fontWeight: '600', fontSize: 12.5 },
   photoPreview: { width: '100%', height: 160 },

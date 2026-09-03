@@ -1,8 +1,10 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
 import { useCallback, useEffect, useState } from 'react';
-import { FlatList, Modal, Pressable, StyleSheet, Text, View } from 'react-native';
+import { FlatList, Modal, Pressable, StyleSheet, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { Text } from '@/components/app-text';
 import { C } from '@/constants/handyhub-theme';
 import { useAuth } from '@/hooks/use-auth';
 import { fetchNotifications, markAllNotificationsRead, type AppNotification } from '@/lib/notifications';
@@ -53,8 +55,8 @@ export function NotificationBell() {
 
   return (
     <>
-      <Pressable onPress={open} style={styles.button}>
-        <Ionicons color="#FFFFFF" name="notifications" size={14} />
+      <Pressable hitSlop={6} onPress={open} style={styles.button}>
+        <Ionicons color="#FFFFFF" name="notifications" size={20} />
         {unreadCount > 0 && (
           <View style={styles.badge}>
             <Text style={styles.badgeText}>{unreadCount > 9 ? '9+' : unreadCount}</Text>
@@ -64,7 +66,7 @@ export function NotificationBell() {
 
       <Modal animationType="slide" onRequestClose={() => setVisible(false)} transparent visible={visible}>
         <Pressable onPress={() => setVisible(false)} style={styles.backdrop} />
-        <View style={styles.sheet}>
+        <SafeAreaView edges={['bottom', 'left', 'right']} style={styles.sheet}>
           <View style={styles.handle} />
           <Text style={styles.title}>Notifications</Text>
           {items.length === 0 ? (
@@ -86,15 +88,15 @@ export function NotificationBell() {
               style={styles.list}
             />
           )}
-        </View>
+        </SafeAreaView>
       </Modal>
     </>
   );
 }
 
 const styles = StyleSheet.create({
-  button: { width: 34, height: 34, borderRadius: 12, backgroundColor: 'rgba(255,255,255,0.1)', alignItems: 'center', justifyContent: 'center' },
-  badge: { position: 'absolute', top: -3, right: -3, minWidth: 16, height: 16, borderRadius: 8, backgroundColor: C.brand, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 3, borderWidth: 1.5, borderColor: C.ink },
+  button: { width: 44, height: 44, borderRadius: 14, backgroundColor: 'rgba(255,255,255,0.1)', alignItems: 'center', justifyContent: 'center' },
+  badge: { position: 'absolute', top: 1, right: 1, minWidth: 16, height: 16, borderRadius: 8, backgroundColor: C.brand, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 3, borderWidth: 1.5, borderColor: C.ink },
   badgeText: { color: '#FFFFFF', fontSize: 8.5, fontWeight: '800' },
   backdrop: { flex: 1, backgroundColor: 'rgba(19,32,67,0.5)' },
   sheet: { backgroundColor: C.card, borderTopLeftRadius: 24, borderTopRightRadius: 24, paddingHorizontal: 20, paddingTop: 12, paddingBottom: 28, maxHeight: '75%' },

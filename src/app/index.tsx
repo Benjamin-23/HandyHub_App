@@ -11,41 +11,50 @@ import {
   RefreshControl,
   ScrollView,
   StyleSheet,
-  Text,
   TextInput,
   View,
 } from 'react-native';
 import Animated, { useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AgentScreen } from '@/components/agent-screen';
+import { DateTimePickerField, LocationPicker, PhotoPicker, type JobPhoto } from '@/components/job-scheduling-fields';
 import { LoginScreen } from '@/components/login-screen';
 import { NotificationBell } from '@/components/notification-bell';
 import { PendingApprovalScreen } from '@/components/pending-approval-screen';
+import { ProfileMenu } from '@/components/profile-menu';
+import { Text } from '@/components/app-text';
 import { VerifyIdentityScreen } from '@/components/verify-identity-screen';
 import { WorkerProfileScreen } from '@/components/worker-profile-screen';
 import { SERVICE_CATEGORIES, SERVICE_CATEGORY_LABELS, type ServiceCategory } from '@/constants/categories';
 import { C } from '@/constants/handyhub-theme';
 import { useAuth, type AuthUser } from '@/hooks/use-auth';
 import {
+  acceptJobOffer,
   acceptOffer,
-  claimJob,
   completeJobWithCode,
   confirmSchedule,
+  counterJobOffer,
   counterOffer,
   fetchCustomerJobs,
   fetchJobCounterpartPhone,
+  fetchJobOffers,
+  fetchJobPhotoUrl,
+  fetchMyJobOffers,
   fetchWorkerJobs,
   postJob,
   rateJob,
   recordPayment,
   remitJob,
   startJob,
+  submitJobOffer,
   updateJobDetails,
   type Job,
+  type JobOffer,
   type JobPaymentMethod,
   type JobStatus,
 } from '@/lib/jobs';
+import { formatScheduled } from '@/lib/format';
 import { fetchAvailableWorkers, type IdVerificationStatus, type WorkerListing } from '@/lib/profiles';
 
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
@@ -63,29 +72,6 @@ function useTapScale(target = 0.94) {
 }
 
 const JOB_POLL_INTERVAL_MS = 15000;
-
-const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-const WEEKDAY_LABELS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
-
-const TIME_SLOTS = (() => {
-  const slots: string[] = [];
-  for (let h = 7; h <= 20; h++) {
-    slots.push(`${String(h).padStart(2, '0')}:00`);
-    slots.push(`${String(h).padStart(2, '0')}:30`);
-  }
-  return slots;
-})();
-
-function formatTimeLabel(time: string): string {
-  const [h, m] = time.split(':').map(Number);
-  const hours12 = h % 12 === 0 ? 12 : h % 12;
-  return `${hours12}:${String(m).padStart(2, '0')} ${h < 12 ? 'AM' : 'PM'}`;
-}
-
-function formatScheduled(iso: string): string {
-  const d = new Date(iso);
-  return `${MONTH_NAMES[d.getMonth()]} ${d.getDate()}, ${formatTimeLabel(`${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`)}`;
-}
 
 type Mode = 'customer' | 'worker';
 type CustomerTab = 'home' | 'orders' | 'wallet' | 'messages';
@@ -127,12 +113,12 @@ function Icon({ name, color, size = 18 }: { name: IconName; color: string; size?
   return <Ionicons color={color} name={spec.glyph} size={size} />;
 }
 
-function CustomerHeader({ query, onQueryChange, name, onSignOut }: {
+function CustomerHeader({ query, onQueryChange, name }: {
   query: string;
   onQueryChange: (value: string) => void;
   name: string;
-  onSignOut: () => void;
 }) {
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   return (
     <View style={styles.hero}>
       <View style={styles.brandRow}>
@@ -141,10 +127,11 @@ function CustomerHeader({ query, onQueryChange, name, onSignOut }: {
           <Text style={styles.brandName}>HandyHub</Text>
         </View>
         <View style={styles.headerActions}>
-          <Pressable onPress={onSignOut} style={styles.headerButton}><Icon name="person" color="#FFFFFF" size={14} /></Pressable>
+          <Pressable hitSlop={6} onPress={() => setProfileMenuOpen(true)} style={styles.headerButton}><Icon name="person" color="#FFFFFF" size={20} /></Pressable>
           <NotificationBell />
         </View>
       </View>
+      <ProfileMenu onClose={() => setProfileMenuOpen(false)} visible={profileMenuOpen} />
       <Text style={styles.greeting}>Good evening, {name}</Text>
       <Text style={styles.headline}>Who&apos;s fixing things today?</Text>
       <View style={styles.searchBar}>
@@ -264,11 +251,10 @@ function EmptyState({ icon, title, text }: { icon: IconName; title: string; text
   );
 }
 
-function CustomerHome({ onBook, onPostJob, name, onSignOut }: {
+function CustomerHome({ onBook, onPostJob, name }: {
   onBook: (pro: Professional) => void;
   onPostJob: () => void;
   name: string;
-  onSignOut: () => void;
 }) {
   const [query, setQuery] = useState('');
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
@@ -298,7 +284,7 @@ function CustomerHome({ onBook, onPostJob, name, onSignOut }: {
 
   return (
     <View style={styles.screenContent}>
-      <CustomerHeader name={name} onQueryChange={setQuery} onSignOut={onSignOut} query={query} />
+      <CustomerHeader name={name} onQueryChange={setQuery} query={query} />
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.customerScroll}>
         <Text style={styles.sectionTitle}>Categories</Text>
         <CategoryGrid
@@ -409,152 +395,16 @@ function CounterpartCall({ job, name }: { job: Job; name: string }) {
   );
 }
 
-// A real calendar-grid date picker + time-slot picker, entirely custom (no
-// native module) so it behaves identically on iOS, Android, and web.
-function DateTimePickerField({ valueIso, onChange }: {
-  valueIso?: string;
-  onChange: (iso: string | undefined) => void;
-}) {
-  const initial = valueIso ? new Date(valueIso) : null;
-  const today = useMemo(() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; }, []);
-
-  const [open, setOpen] = useState(false);
-  const [viewYear, setViewYear] = useState(initial?.getFullYear() ?? today.getFullYear());
-  const [viewMonth, setViewMonth] = useState(initial?.getMonth() ?? today.getMonth());
-  const [selectedDay, setSelectedDay] = useState<number | null>(initial?.getDate() ?? null);
-  const [selectedTime, setSelectedTime] = useState<string | null>(
-    initial ? `${String(initial.getHours()).padStart(2, '0')}:${String(initial.getMinutes()).padStart(2, '0')}` : null,
-  );
-
-  const firstOfMonth = new Date(viewYear, viewMonth, 1);
-  const startWeekday = firstOfMonth.getDay();
-  const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
-  const cells: (number | null)[] = [
-    ...Array.from({ length: startWeekday }, () => null),
-    ...Array.from({ length: daysInMonth }, (_, i) => i + 1),
-  ];
-
-  function commit(day: number | null, time: string | null) {
-    if (day === null || !time) return;
-    const [h, m] = time.split(':').map(Number);
-    onChange(new Date(viewYear, viewMonth, day, h, m, 0).toISOString());
-  }
-
-  function selectDay(day: number) {
-    Haptics.selectionAsync();
-    setSelectedDay(day);
-    commit(day, selectedTime);
-  }
-
-  function selectTime(time: string) {
-    Haptics.selectionAsync();
-    setSelectedTime(time);
-    commit(selectedDay, time);
-  }
-
-  function goMonth(delta: number) {
-    const next = new Date(viewYear, viewMonth + delta, 1);
-    const floor = new Date(today.getFullYear(), today.getMonth(), 1);
-    if (next < floor) return;
-    Haptics.selectionAsync();
-    setViewYear(next.getFullYear());
-    setViewMonth(next.getMonth());
-  }
-
-  function clear() {
-    Haptics.selectionAsync();
-    setSelectedDay(null);
-    setSelectedTime(null);
-    onChange(undefined);
-  }
-
-  const displayText = selectedDay && selectedTime
-    ? `${MONTH_NAMES[viewMonth]} ${selectedDay}, ${formatTimeLabel(selectedTime)}`
-    : 'Pick date & time';
-
-  return (
-    <View>
-      <Pressable
-        onPress={() => { Haptics.selectionAsync(); setOpen((value) => !value); }}
-        style={styles.dateTimeTrigger}>
-        <Ionicons color={C.brand} name="calendar-outline" size={13} />
-        <Text style={styles.dateTimeTriggerText}>{displayText}</Text>
-        {(selectedDay !== null || selectedTime !== null) && (
-          <Pressable hitSlop={8} onPress={clear}>
-            <Ionicons color={C.muted} name="close-circle" size={14} />
-          </Pressable>
-        )}
-      </Pressable>
-
-      {open && (
-        <View style={styles.calendarWrap}>
-          <View style={styles.calendarHeader}>
-            <Pressable hitSlop={8} onPress={() => goMonth(-1)}>
-              <Ionicons color={C.ink} name="chevron-back" size={14} />
-            </Pressable>
-            <Text style={styles.calendarHeaderText}>{MONTH_NAMES[viewMonth]} {viewYear}</Text>
-            <Pressable hitSlop={8} onPress={() => goMonth(1)}>
-              <Ionicons color={C.ink} name="chevron-forward" size={14} />
-            </Pressable>
-          </View>
-
-          <View style={styles.calendarWeekRow}>
-            {WEEKDAY_LABELS.map((label, index) => (
-              <Text key={index} style={styles.calendarWeekday}>{label}</Text>
-            ))}
-          </View>
-
-          <View style={styles.calendarGrid}>
-            {cells.map((day, index) => {
-              if (day === null) return <View key={index} style={styles.calendarCell} />;
-              const isPast = new Date(viewYear, viewMonth, day) < today;
-              const isSelected = day === selectedDay;
-              return (
-                <Pressable
-                  disabled={isPast}
-                  key={index}
-                  onPress={() => selectDay(day)}
-                  style={[styles.calendarCell, isSelected && styles.calendarCellSelected]}>
-                  <Text
-                    style={[
-                      styles.calendarCellText,
-                      isPast && styles.calendarCellTextDisabled,
-                      isSelected && styles.calendarCellTextSelected,
-                    ]}>
-                    {day}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
-
-          <Text style={styles.calendarTimeLabel}>Time</Text>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-            <View style={styles.timeSlotRow}>
-              {TIME_SLOTS.map((slot) => (
-                <Pressable
-                  key={slot}
-                  onPress={() => selectTime(slot)}
-                  style={[styles.timeSlotChip, selectedTime === slot && styles.timeSlotChipActive]}>
-                  <Text style={[styles.timeSlotText, selectedTime === slot && styles.timeSlotTextActive]}>
-                    {formatTimeLabel(slot)}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-          </ScrollView>
-        </View>
-      )}
-    </View>
-  );
-}
-
 // Lets either side adjust the location or scheduled date/time up until a
 // price is agreed — the description and category are never editable by
 // either side, and the DB rejects the update once past 'negotiating'.
-function JobDetailsEditor({ job, busy, onSave }: {
+function JobDetailsEditor({ job, busy, allowLocationEdit, onSave }: {
   job: Job;
   busy: boolean;
+  // Only the customer can move a job's location — a worker negotiating (or
+  // matched to) it never sees this field, so they can't quietly relocate a
+  // job after quoting on it.
+  allowLocationEdit: boolean;
   onSave: (updates: { location?: string; scheduledAt?: string }) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -562,6 +412,7 @@ function JobDetailsEditor({ job, busy, onSave }: {
   const [scheduledAt, setScheduledAt] = useState(job.scheduledAt);
 
   const preAgreement = job.status === 'open' || job.status === 'negotiating';
+  const showLocationField = preAgreement && allowLocationEdit;
   // Unlike location, the schedule can still shift after a price is agreed —
   // it just needs the other side to confirm (see the pending-reschedule note above).
   const canEditSchedule = preAgreement || job.status === 'accepted' || job.status === 'in_progress';
@@ -579,23 +430,14 @@ function JobDetailsEditor({ job, busy, onSave }: {
         onPress={() => { Haptics.selectionAsync(); resetFields(); setOpen(true); }}
         style={styles.editDetailsLink}>
         <Ionicons color={C.muted} name="pencil-outline" size={11} />
-        <Text style={styles.editDetailsText}>{preAgreement ? 'Edit location or schedule' : 'Reschedule'}</Text>
+        <Text style={styles.editDetailsText}>{showLocationField ? 'Edit location or schedule' : 'Reschedule'}</Text>
       </Pressable>
     );
   }
 
   return (
     <View style={styles.editDetailsWrap}>
-      {preAgreement && (
-        <TextInput
-          editable={!busy}
-          onChangeText={setLocation}
-          placeholder="Location (optional)"
-          placeholderTextColor={C.muted}
-          style={styles.counterInput}
-          value={location}
-        />
-      )}
+      {showLocationField && <LocationPicker onChange={setLocation} value={location} />}
       <DateTimePickerField onChange={setScheduledAt} valueIso={scheduledAt} />
       <View style={styles.dualActions}>
         <Pressable disabled={busy} onPress={() => setOpen(false)} style={[styles.smallAction, styles.smallActionGhost]}>
@@ -674,11 +516,83 @@ function PaymentMethodPicker({ job, busy, onRecord }: {
   );
 }
 
-function CustomerJobCard({ job, busy, onAccept, onCounter, onEdit, onConfirmSchedule, onRate, onRecordPayment }: {
+// A private photo — the bucket needs a signed URL to display it, fetched
+// once per photo_path and cached for the life of this component.
+function JobPhotoThumbnail({ photoPath }: { photoPath: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetchJobPhotoUrl(photoPath)
+      .then((signedUrl) => { if (!cancelled) setUrl(signedUrl); })
+      .catch(() => {
+        // Best-effort — the card still works fine without a photo.
+      });
+    return () => { cancelled = true; };
+  }, [photoPath]);
+  if (!url) return null;
+  return <Image source={{ uri: url }} style={styles.jobPhotoThumb} />;
+}
+
+// One worker's negotiation thread on an open job — a job can have several
+// of these in parallel; the customer picks one via onAccept.
+function CustomerOfferRow({ offer, busy, onAccept, onCounter }: {
+  offer: JobOffer;
+  busy: boolean;
+  onAccept: () => void;
+  onCounter: (amount: number) => void;
+}) {
+  const [counterValue, setCounterValue] = useState('');
+  const proCountered = offer.offerBy === 'worker';
+  return (
+    <View style={styles.offerThread}>
+      <View style={proCountered ? styles.offerTheirs : styles.offerMine}>
+        <Text style={proCountered ? styles.offerWhoRed : styles.offerWho}>
+          {proCountered ? `${offer.workerName ?? 'A pro'} offered` : `You countered ${offer.workerName ?? 'a pro'}`}
+        </Text>
+        <Text style={styles.offerAmount}>KSh {offer.currentOffer}</Text>
+      </View>
+      {proCountered ? (
+        <>
+          <View style={styles.dualActions}>
+            <Pressable disabled={busy} onPress={onAccept} style={[styles.smallAction, styles.smallActionPrimary]}>
+              <Text style={styles.smallActionPrimaryText}>Accept KSh {offer.currentOffer}</Text>
+            </Pressable>
+          </View>
+          <View style={styles.counterRow}>
+            <TextInput
+              editable={!busy}
+              keyboardType="number-pad"
+              onChangeText={setCounterValue}
+              placeholder="Your counter (KSh)"
+              placeholderTextColor={C.muted}
+              style={styles.counterInput}
+              value={counterValue}
+            />
+            <Pressable
+              disabled={busy || !Number(counterValue)}
+              onPress={() => { onCounter(Number(counterValue)); setCounterValue(''); }}
+              style={[styles.smallAction, styles.smallActionGhost, styles.counterButton]}>
+              <Text style={styles.smallActionGhostText}>
+                {Number(counterValue) === offer.currentOffer ? 'Accept' : 'Counter'}
+              </Text>
+            </Pressable>
+          </View>
+        </>
+      ) : (
+        <Text style={styles.ticketHint}>Waiting for {offer.workerName ?? 'the pro'} to respond.</Text>
+      )}
+    </View>
+  );
+}
+
+function CustomerJobCard({ job, offers, busy, onAccept, onAcceptOffer, onCounter, onCounterOffer, onEdit, onConfirmSchedule, onRate, onRecordPayment }: {
   job: Job;
+  offers: JobOffer[];
   busy: boolean;
   onAccept: (job: Job) => void;
+  onAcceptOffer: (offer: JobOffer) => void;
   onCounter: (job: Job, amount: number) => void;
+  onCounterOffer: (offer: JobOffer, amount: number) => void;
   onEdit: (job: Job, updates: { location?: string; scheduledAt?: string }) => void;
   onConfirmSchedule: (job: Job) => void;
   onRate: (job: Job, rating: number) => void;
@@ -687,14 +601,18 @@ function CustomerJobCard({ job, busy, onAccept, onCounter, onEdit, onConfirmSche
   const [counterValue, setCounterValue] = useState('');
   const proCountered = job.status === 'negotiating' && job.offerBy === 'worker';
   const displayPrice = job.finalPrice ?? job.currentOffer ?? job.listedPrice;
+  // An agent's suggestion is just a label on an otherwise still-open job — it
+  // never sets worker_id, so this only ever applies while status is 'open'.
+  const suggestedOpen = job.status === 'open' && !!job.suggestedWorkerName;
 
   const statusText =
-    job.status === 'open' ? 'Finding a pro'
-      : job.status === 'negotiating' ? (proCountered ? 'Pro countered' : 'Waiting for pro')
-        : job.status === 'accepted' ? 'Accepted'
-          : job.status === 'in_progress' ? 'In progress'
-            : job.status === 'completed' ? 'Completed'
-              : 'Cancelled';
+    suggestedOpen ? `Assigned to ${job.suggestedWorkerName}`
+      : job.status === 'open' ? 'Finding a pro'
+        : job.status === 'negotiating' ? (proCountered ? 'Pro countered' : 'Waiting for pro')
+          : job.status === 'accepted' ? 'Accepted'
+            : job.status === 'in_progress' ? 'In progress'
+              : job.status === 'completed' ? 'Completed'
+                : 'Cancelled';
   const tone: 'orange' | 'blue' | 'green' =
     job.status === 'completed' ? 'green' : job.status === 'accepted' || job.status === 'in_progress' ? 'orange' : 'blue';
 
@@ -702,12 +620,22 @@ function CustomerJobCard({ job, busy, onAccept, onCounter, onEdit, onConfirmSche
 
   return (
     <OrderBase
-      date={showPriceRow ? (job.status === 'in_progress' ? 'Today' : 'Done') : undefined}
+      date={
+        showPriceRow
+          ? job.status === 'in_progress'
+            ? 'Today'
+            : job.completedAt
+              ? formatScheduled(job.completedAt)
+              : 'Done'
+          : undefined
+      }
       price={showPriceRow && displayPrice !== undefined ? `KSh ${displayPrice}${job.payType === 'hourly' ? '/hr' : ''}` : undefined}
-      professional={job.workerName ?? 'Not yet matched'}
+      professional={job.workerName ?? job.suggestedWorkerName ?? 'Not yet matched'}
       service={job.service}
       status={statusText}
       tone={tone}>
+      {job.photoPath && <JobPhotoThumbnail photoPath={job.photoPath} />}
+
       {job.scheduledAt && (
         <View style={styles.scheduleRow}>
           <Ionicons color={C.muted} name="calendar-outline" size={12} />
@@ -716,7 +644,28 @@ function CustomerJobCard({ job, busy, onAccept, onCounter, onEdit, onConfirmSche
       )}
 
       {job.status === 'open' && (
-        <Text style={styles.ticketHint}>Posted — waiting for a matching pro to respond.</Text>
+        offers.length > 0 ? (
+          <View style={styles.offersList}>
+            <Text style={styles.offersListTitle}>
+              {offers.length} {offers.length === 1 ? 'pro is' : 'pros are'} negotiating — pick one to match:
+            </Text>
+            {offers.map((offer) => (
+              <CustomerOfferRow
+                busy={busy}
+                key={offer.id}
+                offer={offer}
+                onAccept={() => onAcceptOffer(offer)}
+                onCounter={(amount) => onCounterOffer(offer, amount)}
+              />
+            ))}
+          </View>
+        ) : (
+          <Text style={styles.ticketHint}>
+            {suggestedOpen
+              ? `Waiting for negotiation with ${job.suggestedWorkerName} — your agent introduced them.`
+              : 'Posted — waiting for a matching pro to respond.'}
+          </Text>
+        )
       )}
 
       {job.status === 'negotiating' && (
@@ -816,19 +765,25 @@ function CustomerJobCard({ job, busy, onAccept, onCounter, onEdit, onConfirmSche
       )}
 
       <CounterpartCall job={job} name={job.workerName ?? 'the pro'} />
-      <JobDetailsEditor busy={busy} job={job} onSave={(updates) => onEdit(job, updates)} />
+      <JobDetailsEditor allowLocationEdit busy={busy} job={job} onSave={(updates) => onEdit(job, updates)} />
     </OrderBase>
   );
 }
 
 function OrdersScreen({ userId, refreshKey }: { userId: string; refreshKey: number }) {
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [offers, setOffers] = useState<JobOffer[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [busyJobId, setBusyJobId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(() => fetchCustomerJobs(userId), [userId]);
+  const load = useCallback(async () => {
+    const data = await fetchCustomerJobs(userId);
+    const openJobIds = data.filter((job) => job.status === 'open').map((job) => job.id);
+    const offerData = await fetchJobOffers(openJobIds);
+    return { data, offerData };
+  }, [userId]);
 
   // Poll so a price change or accept from the worker's side (or a new match
   // on an open job) shows up here without the customer having to pull-to-refresh.
@@ -836,7 +791,7 @@ function OrdersScreen({ userId, refreshKey }: { userId: string; refreshKey: numb
     let cancelled = false;
     function poll() {
       load()
-        .then((data) => { if (!cancelled) { setJobs(data); setError(null); } })
+        .then(({ data, offerData }) => { if (!cancelled) { setJobs(data); setOffers(offerData); setError(null); } })
         .catch((err) => { if (!cancelled) setError(err instanceof Error ? err.message : 'Could not load your jobs.'); })
         .finally(() => { if (!cancelled) setIsLoading(false); });
     }
@@ -846,7 +801,9 @@ function OrdersScreen({ userId, refreshKey }: { userId: string; refreshKey: numb
   }, [load, refreshKey]);
 
   async function refresh() {
-    setJobs(await load());
+    const { data, offerData } = await load();
+    setJobs(data);
+    setOffers(offerData);
     setError(null);
   }
 
@@ -882,6 +839,35 @@ function OrdersScreen({ userId, refreshKey }: { userId: string; refreshKey: numb
     try {
       if (matchesCurrentOffer) await acceptOffer(job.id, amount);
       else await counterOffer(job.id, amount, 'customer');
+      await refresh();
+    } catch (err) {
+      Alert.alert('Could not send counter-offer', err instanceof Error ? err.message : 'Please try again.');
+    }
+    setBusyJobId(null);
+  }
+
+  // Multiple workers can negotiate one open job in parallel (see
+  // src/lib/jobs.ts's job_offers functions) — accepting one offer matches
+  // the job to that worker and declines every other active offer on it.
+  async function handleAcceptOffer(job: Job, offer: JobOffer) {
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    setBusyJobId(job.id);
+    try {
+      await acceptJobOffer(offer.id);
+      await refresh();
+    } catch (err) {
+      Alert.alert('Could not accept', err instanceof Error ? err.message : 'Please try again.');
+    }
+    setBusyJobId(null);
+  }
+
+  async function handleCounterOffer(job: Job, offer: JobOffer, amount: number) {
+    const matchesCurrentOffer = amount === offer.currentOffer;
+    Haptics.impactAsync(matchesCurrentOffer ? Haptics.ImpactFeedbackStyle.Light : Haptics.ImpactFeedbackStyle.Medium);
+    setBusyJobId(job.id);
+    try {
+      if (matchesCurrentOffer) await acceptJobOffer(offer.id);
+      else await counterJobOffer(offer.id, amount, 'customer');
       await refresh();
     } catch (err) {
       Alert.alert('Could not send counter-offer', err instanceof Error ? err.message : 'Please try again.');
@@ -947,9 +933,12 @@ function OrdersScreen({ userId, refreshKey }: { userId: string; refreshKey: numb
         busy={busyJobId === job.id}
         job={job}
         key={job.id}
+        offers={offers.filter((offer) => offer.jobId === job.id)}
         onAccept={handleAccept}
+        onAcceptOffer={(offer) => handleAcceptOffer(job, offer)}
         onConfirmSchedule={handleConfirmSchedule}
         onCounter={handleCounter}
+        onCounterOffer={(offer, amount) => handleCounterOffer(job, offer, amount)}
         onEdit={handleEdit}
         onRate={handleRate}
         onRecordPayment={handleRecordPayment}
@@ -1019,6 +1008,33 @@ const initialTransactions = [
   { name: 'M-Pesa top up', date: '2 Aug', amount: '+5,000', positive: true },
 ];
 
+function PaymentSplitRow({ paidViaApp, paidDirect, directSub }: {
+  paidViaApp: number;
+  paidDirect: number;
+  directSub: string;
+}) {
+  return (
+    <View style={styles.paymentSplitRow}>
+      <View style={styles.paymentSplitCard}>
+        <View style={[styles.paymentSplitIconBadge, styles.paymentSplitIconBadgeApp]}>
+          <Ionicons color={C.teal} name="phone-portrait-outline" size={15} />
+        </View>
+        <Text style={styles.paymentSplitLabel}>Paid via app</Text>
+        <Text style={styles.paymentSplitAmount}>KSh {paidViaApp.toLocaleString()}</Text>
+        <Text style={[styles.paymentSplitSub, styles.paymentSplitSubApp]}>Commission auto-deducted</Text>
+      </View>
+      <View style={styles.paymentSplitCard}>
+        <View style={[styles.paymentSplitIconBadge, styles.paymentSplitIconBadgeDirect]}>
+          <Ionicons color={C.brand} name="cash-outline" size={15} />
+        </View>
+        <Text style={styles.paymentSplitLabel}>Paid directly</Text>
+        <Text style={styles.paymentSplitAmount}>KSh {paidDirect.toLocaleString()}</Text>
+        <Text style={[styles.paymentSplitSub, styles.paymentSplitSubDirect]}>{directSub}</Text>
+      </View>
+    </View>
+  );
+}
+
 function WalletScreen({ userId }: { userId: string }) {
   const [balance, setBalance] = useState(4250);
   const [transactions, setTransactions] = useState(initialTransactions);
@@ -1050,13 +1066,6 @@ function WalletScreen({ userId }: { userId: string }) {
     setTransactions((current) => [{ name: 'M-Pesa top up', date: 'Just now', amount: '+1,000', positive: true }, ...current]);
   }
 
-  function withdraw() {
-    if (!balance) return;
-    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    setTransactions((current) => [{ name: 'Wallet withdrawal', date: 'Just now', amount: `−${balance.toLocaleString()}`, positive: false }, ...current]);
-    setBalance(0);
-  }
-
   return (
     <View style={styles.screenContent}>
       <SimpleHeader title="Wallet" />
@@ -1067,7 +1076,6 @@ function WalletScreen({ userId }: { userId: string }) {
           <Text style={styles.balanceAmount}>KSh {balance.toLocaleString()}</Text>
           <View style={styles.walletActions}>
             <Pressable onPress={topUp} style={[styles.walletButton, styles.topUpButton]}><Text style={styles.topUpText}>+ Top Up</Text></Pressable>
-            <Pressable onPress={withdraw} style={[styles.walletButton, styles.withdrawButton]}><Text style={styles.withdrawText}>Withdraw</Text></Pressable>
           </View>
         </View>
 
@@ -1075,18 +1083,7 @@ function WalletScreen({ userId }: { userId: string }) {
         {isLoadingPayments ? (
           <ActivityIndicator color={C.brand} style={styles.ordersLoading} />
         ) : (
-          <View style={styles.paymentSplitRow}>
-            <View style={styles.paymentSplitCard}>
-              <Text style={styles.paymentSplitLabel}>Paid via app</Text>
-              <Text style={styles.paymentSplitAmount}>KSh {paidViaApp.toLocaleString()}</Text>
-              <Text style={styles.paymentSplitSub}>Commission auto-deducted</Text>
-            </View>
-            <View style={styles.paymentSplitCard}>
-              <Text style={styles.paymentSplitLabel}>Paid directly</Text>
-              <Text style={styles.paymentSplitAmount}>KSh {paidDirect.toLocaleString()}</Text>
-              <Text style={styles.paymentSplitSub}>Cash / mobile money to pro</Text>
-            </View>
-          </View>
+          <PaymentSplitRow directSub="Cash / mobile money to pro" paidDirect={paidDirect} paidViaApp={paidViaApp} />
         )}
 
         <Text style={styles.ordersSection}>Recent transactions</Text>
@@ -1132,16 +1129,15 @@ function MessagesScreen() {
   );
 }
 
-function CustomerScreen({ tab, userId, jobsRefreshKey, onBook, onPostJob, name, onSignOut }: {
+function CustomerScreen({ tab, userId, jobsRefreshKey, onBook, onPostJob, name }: {
   tab: CustomerTab;
   userId: string;
   jobsRefreshKey: number;
   onBook: (pro: Professional) => void;
   onPostJob: () => void;
   name: string;
-  onSignOut: () => void;
 }) {
-  if (tab === 'home') return <CustomerHome name={name} onBook={onBook} onPostJob={onPostJob} onSignOut={onSignOut} />;
+  if (tab === 'home') return <CustomerHome name={name} onBook={onBook} onPostJob={onPostJob} />;
   if (tab === 'orders') return <OrdersScreen refreshKey={jobsRefreshKey} userId={userId} />;
   if (tab === 'wallet') return <WalletScreen userId={userId} />;
   return <MessagesScreen />;
@@ -1154,8 +1150,8 @@ function SimpleHeader({ title, onSignOut, right }: { title: string; onSignOut?: 
       <View style={styles.simpleHeaderActions}>
         {right}
         {onSignOut && (
-          <Pressable onPress={onSignOut} style={styles.headerButton}>
-            <Icon name="person" color="#FFFFFF" size={14} />
+          <Pressable hitSlop={6} onPress={onSignOut} style={styles.headerButton}>
+            <Icon name="person" color="#FFFFFF" size={20} />
           </Pressable>
         )}
       </View>
@@ -1181,8 +1177,13 @@ const WORKER_STATUS_BADGE: Record<JobStatus, 'upcoming' | 'live' | 'done'> = {
   cancelled: 'done',
 };
 
-function WorkerJobCard({ job, busy, onAccept, onCounter, onStart, onComplete, onEdit }: {
+function WorkerJobCard({ job, myOffer, currentWorkerId, busy, onAccept, onCounter, onStart, onComplete, onEdit }: {
   job: Job;
+  // My own negotiation thread on this job — only set for an 'open' job I've
+  // already quoted (see fetchMyJobOffers in WorkerJobs). Several other
+  // workers may have their own threads on the same job; I only ever see mine.
+  myOffer?: JobOffer;
+  currentWorkerId?: string;
   busy: boolean;
   onAccept: (job: Job) => void;
   onCounter: (job: Job, amount: number) => void;
@@ -1193,9 +1194,18 @@ function WorkerJobCard({ job, busy, onAccept, onCounter, onStart, onComplete, on
   const [counterValue, setCounterValue] = useState('');
   const [codeValue, setCodeValue] = useState('');
 
-  const myTurn = job.status === 'open' || (job.status === 'negotiating' && job.offerBy === 'customer');
-  const price = job.finalPrice ?? job.currentOffer ?? job.listedPrice;
+  const negotiatingOpen = job.status === 'open' && !!myOffer;
+  const myTurn = negotiatingOpen
+    ? myOffer?.offerBy === 'customer'
+    : job.status === 'open' || (job.status === 'negotiating' && job.offerBy === 'customer');
+  const price = negotiatingOpen
+    ? myOffer?.currentOffer
+    : job.finalPrice ?? job.currentOffer ?? job.listedPrice;
   const badge = WORKER_STATUS_BADGE[job.status];
+  // An agent introduced this open job to me specifically — still just a
+  // label (the job stays 'open' until I actually claim it), but it should
+  // read as "Negotiating" here so I notice it's waiting on a reply.
+  const suggestedForMe = job.status === 'open' && job.suggestedWorkerId === currentWorkerId;
 
   return (
     <View style={styles.jobCard}>
@@ -1206,14 +1216,21 @@ function WorkerJobCard({ job, busy, onAccept, onCounter, onStart, onComplete, on
             Customer: {job.customerName ?? 'Unknown'}{job.location ? ` · ${job.location}` : ''}
             {job.scheduledAt ? ` · ${formatScheduled(job.scheduledAt)}` : ''}
           </Text>
+          {job.status === 'completed' && job.completedAt && (
+            <Text style={styles.jobCustomer}>Completed {formatScheduled(job.completedAt)}</Text>
+          )}
+          {suggestedForMe && !myOffer && <Text style={styles.suggestedForMeText}>Recommended by their agent — reply to start negotiating.</Text>}
         </View>
         <View style={[styles.jobBadge, styles[`jobBadge_${badge}`]]}>
           <Text style={[styles.jobBadgeText, styles[`jobBadgeText_${badge}`]]}>
-            {job.status === 'negotiating' ? (myTurn ? 'Your turn' : 'Waiting on customer') : WORKER_STATUS_LABEL[job.status]}
+            {negotiatingOpen || job.status === 'negotiating'
+              ? (myTurn ? 'Your turn' : 'Waiting on customer')
+              : suggestedForMe ? 'Negotiating' : WORKER_STATUS_LABEL[job.status]}
           </Text>
         </View>
       </View>
       <View style={styles.jobDivider} />
+      {job.photoPath && <JobPhotoThumbnail photoPath={job.photoPath} />}
       <View style={styles.jobFoot}>
         <View style={styles.jobFootLeft}>
           <View style={styles.jobPayTypePill}>
@@ -1227,7 +1244,9 @@ function WorkerJobCard({ job, busy, onAccept, onCounter, onStart, onComplete, on
         <>
           <View style={styles.dualActions}>
             <Pressable disabled={busy} onPress={() => onAccept(job)} style={[styles.smallAction, styles.smallActionPrimary]}>
-              <Text style={styles.smallActionPrimaryText}>Accept KSh {price}</Text>
+              <Text style={styles.smallActionPrimaryText}>
+                {job.status === 'open' && !myOffer ? `Quote KSh ${price}` : `Accept KSh ${price}`}
+              </Text>
             </Pressable>
           </View>
           <View style={styles.counterRow}>
@@ -1245,11 +1264,15 @@ function WorkerJobCard({ job, busy, onAccept, onCounter, onStart, onComplete, on
               onPress={() => { onCounter(job, Number(counterValue)); setCounterValue(''); }}
               style={[styles.smallAction, styles.smallActionGhost, styles.counterButton]}>
               <Text style={styles.smallActionGhostText}>
-                {Number(counterValue) === price ? 'Accept' : 'Counter'}
+                {Number(counterValue) === price ? (job.status === 'open' && !myOffer ? 'Quote' : 'Accept') : 'Counter'}
               </Text>
             </Pressable>
           </View>
         </>
+      )}
+
+      {negotiatingOpen && !myTurn && (
+        <Text style={styles.ticketHint}>Offer sent — waiting for {job.customerName ?? 'the customer'} to pick a pro.</Text>
       )}
 
       {job.status === 'negotiating' && !myTurn && (
@@ -1306,7 +1329,7 @@ function WorkerJobCard({ job, busy, onAccept, onCounter, onStart, onComplete, on
       )}
 
       <CounterpartCall job={job} name={job.customerName ?? 'the customer'} />
-      {job.workerId && <JobDetailsEditor busy={busy} job={job} onSave={(updates) => onEdit(job, updates)} />}
+      {job.workerId && <JobDetailsEditor allowLocationEdit={false} busy={busy} job={job} onSave={(updates) => onEdit(job, updates)} />}
     </View>
   );
 }
@@ -1314,20 +1337,24 @@ function WorkerJobCard({ job, busy, onAccept, onCounter, onStart, onComplete, on
 function WorkerJobs({ onSignOut }: { onSignOut: () => void }) {
   const { user } = useAuth();
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [myOffers, setMyOffers] = useState<JobOffer[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [busyJobId, setBusyJobId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(() => fetchWorkerJobs(), []);
+  const load = useCallback(async () => {
+    const [data, offerData] = await Promise.all([fetchWorkerJobs(), fetchMyJobOffers()]);
+    return { data, offerData };
+  }, []);
 
-  // Poll so a customer's counter-offer shows up here without the worker
-  // having to pull-to-refresh.
+  // Poll so a customer's counter-offer (or another worker winning a job I'd
+  // quoted on) shows up here without the worker having to pull-to-refresh.
   useEffect(() => {
     let cancelled = false;
     function poll() {
       load()
-        .then((data) => { if (!cancelled) { setJobs(data); setError(null); } })
+        .then(({ data, offerData }) => { if (!cancelled) { setJobs(data); setMyOffers(offerData); setError(null); } })
         .catch((err) => { if (!cancelled) setError(err instanceof Error ? err.message : 'Could not load your jobs.'); })
         .finally(() => { if (!cancelled) setIsLoading(false); });
     }
@@ -1337,7 +1364,9 @@ function WorkerJobs({ onSignOut }: { onSignOut: () => void }) {
   }, [load]);
 
   async function refresh() {
-    setJobs(await load());
+    const { data, offerData } = await load();
+    setJobs(data);
+    setMyOffers(offerData);
     setError(null);
   }
 
@@ -1353,13 +1382,31 @@ function WorkerJobs({ onSignOut }: { onSignOut: () => void }) {
 
   async function handleAccept(job: Job) {
     if (!user) return;
+    if (job.status === 'open') {
+      const myOffer = myOffers.find((offer) => offer.jobId === job.id);
+      const price = myOffer?.currentOffer ?? job.listedPrice;
+      if (price === undefined) return;
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      setBusyJobId(job.id);
+      try {
+        // No thread yet: this is my opening quote. Otherwise I'm agreeing to
+        // the customer's counter — either way the customer still has to pick
+        // me via accept_job_offer before the job actually matches.
+        if (myOffer) await counterJobOffer(myOffer.id, price, 'worker');
+        else await submitJobOffer(job.id, user.id, price);
+        await refresh();
+      } catch (err) {
+        Alert.alert('Could not send quote', err instanceof Error ? err.message : 'Please try again.');
+      }
+      setBusyJobId(null);
+      return;
+    }
     const price = job.currentOffer ?? job.listedPrice;
     if (price === undefined) return;
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     setBusyJobId(job.id);
     try {
-      if (job.status === 'open') await claimJob(job.id, user.id);
-      else await acceptOffer(job.id, price);
+      await acceptOffer(job.id, price);
       await refresh();
     } catch (err) {
       Alert.alert('Could not accept', err instanceof Error ? err.message : 'Please try again.');
@@ -1369,15 +1416,28 @@ function WorkerJobs({ onSignOut }: { onSignOut: () => void }) {
 
   async function handleCounter(job: Job, amount: number) {
     if (!user) return;
+    if (job.status === 'open') {
+      const myOffer = myOffers.find((offer) => offer.jobId === job.id);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      setBusyJobId(job.id);
+      try {
+        if (myOffer) await counterJobOffer(myOffer.id, amount, 'worker');
+        else await submitJobOffer(job.id, user.id, amount);
+        await refresh();
+      } catch (err) {
+        Alert.alert('Could not send counter-offer', err instanceof Error ? err.message : 'Please try again.');
+      }
+      setBusyJobId(null);
+      return;
+    }
     // Typing back the price already on the table isn't a counter — it's an
-    // agreement. Accept/claim outright instead of bouncing the same number back.
+    // agreement. Accept outright instead of bouncing the same number back.
     const price = job.currentOffer ?? job.listedPrice;
     const matchesCurrentOffer = price !== undefined && amount === price;
     Haptics.impactAsync(matchesCurrentOffer ? Haptics.ImpactFeedbackStyle.Light : Haptics.ImpactFeedbackStyle.Medium);
     setBusyJobId(job.id);
     try {
-      if (job.status === 'open') await claimJob(job.id, user.id, matchesCurrentOffer ? undefined : amount);
-      else if (matchesCurrentOffer) await acceptOffer(job.id, amount);
+      if (matchesCurrentOffer) await acceptOffer(job.id, amount);
       else await counterOffer(job.id, amount, 'worker');
       await refresh();
     } catch (err) {
@@ -1447,8 +1507,10 @@ function WorkerJobs({ onSignOut }: { onSignOut: () => void }) {
               {items.map((job) => (
                 <WorkerJobCard
                   busy={busyJobId === job.id}
+                  currentWorkerId={user?.id}
                   job={job}
                   key={job.id}
+                  myOffer={myOffers.find((offer) => offer.jobId === job.id)}
                   onAccept={handleAccept}
                   onComplete={handleComplete}
                   onCounter={handleCounter}
@@ -1536,6 +1598,13 @@ function WorkerEarnings() {
   const totalEarned = completedJobs.reduce((sum, job) => sum + (job.finalPrice ?? 0) - (job.commission ?? 0), 0);
   const remittanceDue = pendingRemit.reduce((sum, job) => sum + (job.commission ?? 0), 0);
 
+  const autoRemittedCommission = remittedJobs
+    .filter((job) => job.paymentMethod === 'in_app')
+    .reduce((sum, job) => sum + (job.commission ?? 0), 0);
+  const directRemittedCommission = remittedJobs
+    .filter((job) => job.paymentMethod === 'direct')
+    .reduce((sum, job) => sum + (job.commission ?? 0), 0);
+
   const paidViaApp = jobs
     .filter((job) => job.paymentMethod === 'in_app')
     .reduce((sum, job) => sum + (job.finalPrice ?? job.listedPrice ?? job.currentOffer ?? 0), 0);
@@ -1616,22 +1685,21 @@ function WorkerEarnings() {
             )}
 
             <Text style={styles.ordersSection}>How you&apos;ve been paid</Text>
-            <View style={styles.paymentSplitRow}>
-              <View style={styles.paymentSplitCard}>
-                <Text style={styles.paymentSplitLabel}>Paid via app</Text>
-                <Text style={styles.paymentSplitAmount}>KSh {paidViaApp.toLocaleString()}</Text>
-                <Text style={styles.paymentSplitSub}>Commission auto-deducted</Text>
-              </View>
-              <View style={styles.paymentSplitCard}>
-                <Text style={styles.paymentSplitLabel}>Paid directly</Text>
-                <Text style={styles.paymentSplitAmount}>KSh {paidDirect.toLocaleString()}</Text>
-                <Text style={styles.paymentSplitSub}>Cash / mobile money from customer</Text>
-              </View>
-            </View>
+            <PaymentSplitRow directSub="Cash / mobile money from customer" paidDirect={paidDirect} paidViaApp={paidViaApp} />
 
             <Text style={styles.ordersSection}>How your earnings work</Text>
-            <SettlementCard title="Customer pays via app" description="HandyHub deducts its 10% automatically" note="Remitted instantly" positive />
-            <SettlementCard title="Customer pays you directly" description="They give you a transaction code as proof" note="You remit the 10% yourself" positive={false} />
+            <SettlementCard
+              description="HandyHub deducts its 10% automatically"
+              note={`KSh ${autoRemittedCommission.toLocaleString()} auto-paid`}
+              positive
+              title="Customer pays via app"
+            />
+            <SettlementCard
+              description="They give you a transaction code as proof"
+              note={`KSh ${directRemittedCommission.toLocaleString()} direct-paid`}
+              positive={false}
+              title="Customer pays you directly"
+            />
 
             <Text style={styles.ordersSection}>Remittance history</Text>
             {remittedJobs.length === 0 ? (
@@ -1643,10 +1711,12 @@ function WorkerEarnings() {
                     <Icon name="checkmark" color={C.teal} size={15} />
                   </View>
                   <View style={styles.transactionInfo}>
-                    <Text style={styles.transactionName}>{job.service}</Text>
+                    <Text style={styles.transactionName}>
+                      {job.service}{job.customerName ? ` · ${job.customerName}` : ''}
+                    </Text>
                     <Text style={styles.transactionDate}>
                       {job.paymentMethod === 'in_app' ? 'Auto-remitted · paid via app' : 'Remitted · paid directly'}
-                      {job.remittedAt ? ` · ${formatScheduled(job.remittedAt)}` : ''}
+                      {job.completedAt ? ` · Completed ${formatScheduled(job.completedAt)}` : ''}
                     </Text>
                   </View>
                   <Text style={styles.transactionAmount}>−{job.commission?.toLocaleString()}</Text>
@@ -1726,8 +1796,9 @@ function BottomNav({ mode, customerTab, workerTab, onCustomerTab, onWorkerTab }:
 }) {
   const items = mode === 'customer' ? customerNav : workerNav;
   const active = mode === 'customer' ? customerTab : workerTab;
+  const insets = useSafeAreaInsets();
   return (
-    <View style={styles.bottomNav}>
+    <View style={[styles.bottomNav, { paddingBottom: 5 + insets.bottom }]}>
       {items.map((item) => {
         const selected = item.key === active;
         return (
@@ -1828,7 +1899,15 @@ function BookingModal({ pro, onClose, onConfirm }: {
   );
 }
 
-type PostJobParams = { category: string; service: string; offer: number; location?: string; scheduledAt?: string };
+type PostJobParams = {
+  category: string;
+  service: string;
+  offer: number;
+  location?: string;
+  scheduledAt?: string;
+  photoBase64?: string;
+  photoExtension?: 'jpg' | 'png';
+};
 
 function PostJobModal({ visible, onClose, onConfirm }: {
   visible: boolean;
@@ -1840,6 +1919,7 @@ function PostJobModal({ visible, onClose, onConfirm }: {
   const [offerAmount, setOfferAmount] = useState('');
   const [location, setLocation] = useState('');
   const [scheduledAt, setScheduledAt] = useState<string | undefined>(undefined);
+  const [photo, setPhoto] = useState<JobPhoto | null>(null);
 
   const canSubmit = service.trim().length > 0 && Number(offerAmount) > 0;
 
@@ -1851,12 +1931,15 @@ function PostJobModal({ visible, onClose, onConfirm }: {
       offer: Number(offerAmount),
       location: location.trim() || undefined,
       scheduledAt,
+      photoBase64: photo?.base64,
+      photoExtension: photo?.extension,
     });
     setCategory(SERVICE_CATEGORY_LABELS[0]);
     setService('');
     setOfferAmount('');
     setLocation('');
     setScheduledAt(undefined);
+    setPhoto(null);
   }
 
   return (
@@ -1901,14 +1984,11 @@ function PostJobModal({ visible, onClose, onConfirm }: {
             value={offerAmount}
           />
 
+          <Text style={[styles.modalLabel, styles.modalInputLabel]}>Photo of the issue (optional)</Text>
+          <PhotoPicker onChange={setPhoto} photo={photo} />
+
           <Text style={[styles.modalLabel, styles.modalInputLabel]}>Location (optional)</Text>
-          <TextInput
-            onChangeText={setLocation}
-            placeholder="e.g. Westlands, Nairobi"
-            placeholderTextColor={C.muted}
-            style={styles.modalInput}
-            value={location}
-          />
+          <LocationPicker onChange={setLocation} value={location} />
 
           <Text style={[styles.modalLabel, styles.modalInputLabel]}>When (optional)</Text>
           <DateTimePickerField onChange={setScheduledAt} valueIso={scheduledAt} />
@@ -1984,6 +2064,8 @@ function HandyHubApp({ user, role }: { user: AuthUser; role: Mode }) {
         offer: params.offer,
         location: params.location,
         scheduledAt: params.scheduledAt,
+        photoBase64: params.photoBase64,
+        photoExtension: params.photoExtension,
       });
       setPostJobModalVisible(false);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -2007,7 +2089,6 @@ function HandyHubApp({ user, role }: { user: AuthUser; role: Mode }) {
           name={user.name}
           onBook={setBookingTarget}
           onPostJob={() => setPostJobModalVisible(true)}
-          onSignOut={signOut}
           tab={customerTab}
           userId={user.id}
         />
@@ -2054,12 +2135,12 @@ const styles = StyleSheet.create({
   brandNameRow: { flexDirection: 'row', alignItems: 'center', gap: 9 },
   brandDiamond: { width: 10, height: 10, borderRadius: 3, backgroundColor: C.accent, transform: [{ rotate: '45deg' }] },
   brandName: { color: '#FFFFFF', fontWeight: '800', fontSize: 19, letterSpacing: -0.4 },
-  headerActions: { flexDirection: 'row', gap: 8 },
-  headerButton: { width: 34, height: 34, borderRadius: 12, backgroundColor: 'rgba(255,255,255,0.1)', alignItems: 'center', justifyContent: 'center' },
+  headerActions: { flexDirection: 'row', gap: 10, marginRight: 4 },
+  headerButton: { width: 44, height: 44, borderRadius: 14, backgroundColor: 'rgba(255,255,255,0.1)', alignItems: 'center', justifyContent: 'center' },
   greeting: { fontSize: 11, color: '#AEB8DA', fontWeight: '500', marginBottom: 2 },
   headline: { color: '#FFFFFF', fontSize: 20, fontWeight: '800', letterSpacing: -0.35, marginBottom: 14 },
   searchBar: { height: 45, flexDirection: 'row', gap: 10, alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.1)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.14)', borderRadius: 14, paddingHorizontal: 15 },
-  searchInput: { flex: 1, color: '#FFFFFF', fontSize: 13, paddingVertical: 0 },
+  searchInput: { flex: 1, color: '#FFFFFF', fontSize: 13, paddingVertical: 0, outlineWidth: 1.5, outlineColor: '#D1D5DB', outlineStyle: 'solid' },
   customerScroll: { paddingHorizontal: 18, paddingTop: 17, paddingBottom: 24 },
   sectionTitle: { fontSize: 15, fontWeight: '800', color: C.ink, marginBottom: 12 },
   sectionHeadingRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
@@ -2099,15 +2180,15 @@ const styles = StyleSheet.create({
   quoteHint: { color: C.muted, fontSize: 8.5 },
   simpleHeader: { minHeight: 55, backgroundColor: C.ink2, borderBottomLeftRadius: 26, borderBottomRightRadius: 26, paddingHorizontal: 19, paddingVertical: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   simpleHeaderTitle: { color: '#FFFFFF', fontSize: 18, fontWeight: '800' },
-  simpleHeaderActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  simpleHeaderActions: { flexDirection: 'row', alignItems: 'center', gap: 10, marginRight: 4 },
   ordersScroll: { paddingHorizontal: 20, paddingTop: 3, paddingBottom: 26 },
   ordersLoading: { marginTop: 40 },
   ordersSection: { color: C.ink, fontWeight: '800', fontSize: 14, marginTop: 13, marginBottom: 10 },
   errorRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 12 },
   errorText: { color: C.brand, fontSize: 11.5, fontWeight: '600', flex: 1 },
-  counterRow: { flexDirection: 'row', gap: 8, marginTop: 8 },
-  counterInput: { flex: 1, height: 39, borderWidth: 1, borderColor: C.line, borderRadius: 11, paddingHorizontal: 12, backgroundColor: C.cream, color: C.ink, fontSize: 12, outlineWidth: 0 },
-  counterButton: { flex: 0, paddingHorizontal: 16 },
+  counterRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginTop: 8 },
+  counterInput: { flex: 1, height: 39, borderWidth: 1, borderColor: C.line, borderRadius: 11, paddingHorizontal: 12, backgroundColor: C.cream, color: C.ink, fontSize: 12, outlineWidth: 1.5, outlineColor: '#D1D5DB', outlineStyle: 'solid' },
+  counterButton: { flex: 0, minWidth: 84, paddingHorizontal: 18 },
   callRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 10, paddingTop: 10, borderTopWidth: 1, borderTopColor: C.line, borderStyle: 'dashed' },
   callRowText: { color: C.teal, fontWeight: '700', fontSize: 11.5 },
   editDetailsLink: { flexDirection: 'row', alignItems: 'center', gap: 5, alignSelf: 'flex-start', marginTop: 10 },
@@ -2119,25 +2200,6 @@ const styles = StyleSheet.create({
   paymentInfoText: { color: C.teal, fontWeight: '700', fontSize: 11 },
   paymentPickerWrap: { marginTop: 10, paddingTop: 10, borderTopWidth: 1, borderTopColor: C.line, borderStyle: 'dashed' },
   paymentPickerLabel: { color: C.muted, fontWeight: '700', fontSize: 11, marginBottom: 8 },
-  dateTimeTrigger: { flexDirection: 'row', alignItems: 'center', gap: 8, height: 42, borderWidth: 1, borderColor: C.line, borderRadius: 11, paddingHorizontal: 12, backgroundColor: C.cream, marginTop: 7 },
-  dateTimeTriggerText: { flex: 1, color: C.ink, fontWeight: '600', fontSize: 12 },
-  calendarWrap: { marginTop: 8, padding: 10, borderRadius: 13, borderWidth: 1, borderColor: C.line, backgroundColor: C.cream, maxWidth: 240, alignSelf: 'center' },
-  calendarHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 },
-  calendarHeaderText: { color: C.ink, fontWeight: '800', fontSize: 11.5 },
-  calendarWeekRow: { flexDirection: 'row', marginBottom: 2 },
-  calendarWeekday: { flex: 1, textAlign: 'center', color: C.muted, fontWeight: '700', fontSize: 9 },
-  calendarGrid: { flexDirection: 'row', flexWrap: 'wrap' },
-  calendarCell: { width: `${100 / 7}%`, aspectRatio: 1, alignItems: 'center', justifyContent: 'center' },
-  calendarCellSelected: { backgroundColor: C.brand, borderRadius: 999 },
-  calendarCellText: { color: C.ink, fontSize: 10.5, fontWeight: '600' },
-  calendarCellTextDisabled: { color: C.line },
-  calendarCellTextSelected: { color: '#FFFFFF', fontWeight: '800' },
-  calendarTimeLabel: { color: C.muted, fontWeight: '700', fontSize: 10, marginTop: 8, marginBottom: 6 },
-  timeSlotRow: { flexDirection: 'row', gap: 6 },
-  timeSlotChip: { paddingVertical: 6, paddingHorizontal: 9, borderRadius: 9, borderWidth: 1, borderColor: C.line, backgroundColor: C.card },
-  timeSlotChipActive: { backgroundColor: C.brand, borderColor: C.brand },
-  timeSlotText: { color: C.muted, fontWeight: '700', fontSize: 10.5 },
-  timeSlotTextActive: { color: '#FFFFFF' },
   orderCard: { backgroundColor: C.card, borderWidth: 1, borderColor: C.line, borderRadius: 16, padding: 13, marginBottom: 9 },
   orderTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 },
   orderTitleWrap: { flex: 1 },
@@ -2160,6 +2222,9 @@ const styles = StyleSheet.create({
   offerWho: { color: C.muted, fontSize: 10.5, fontWeight: '600' },
   offerWhoRed: { color: C.brand, fontSize: 10.5, fontWeight: '700' },
   offerAmount: { color: C.ink, fontSize: 10.5, fontWeight: '800', fontVariant: ['tabular-nums'] },
+  offersList: { gap: 10, marginTop: 4 },
+  offersListTitle: { color: C.muted, fontSize: 11, fontWeight: '700' },
+  jobPhotoThumb: { width: '100%', height: 130, borderRadius: 13, marginTop: 8, backgroundColor: C.cream },
   dualActions: { flexDirection: 'row', gap: 8, marginTop: 10 },
   smallAction: { flex: 1, minHeight: 39, paddingHorizontal: 8, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
   smallActionPrimary: { backgroundColor: C.teal },
@@ -2186,14 +2251,17 @@ const styles = StyleSheet.create({
   walletActions: { flexDirection: 'row', gap: 9 },
   walletButton: { flex: 1, borderRadius: 11, paddingVertical: 11, alignItems: 'center' },
   topUpButton: { backgroundColor: C.accent },
-  withdrawButton: { backgroundColor: 'rgba(255,255,255,0.1)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.2)' },
   topUpText: { color: C.ink, fontSize: 11, fontWeight: '800' },
-  withdrawText: { color: '#FFFFFF', fontSize: 11, fontWeight: '800' },
   paymentSplitRow: { flexDirection: 'row', gap: 9, marginBottom: 4 },
-  paymentSplitCard: { flex: 1, backgroundColor: C.card, borderWidth: 1, borderColor: C.line, borderRadius: 14, padding: 12 },
-  paymentSplitLabel: { color: C.muted, fontSize: 10, fontWeight: '700', marginBottom: 5 },
-  paymentSplitAmount: { color: C.ink, fontSize: 15, fontWeight: '800', fontVariant: ['tabular-nums'] },
-  paymentSplitSub: { color: C.muted, fontSize: 9, marginTop: 4 },
+  paymentSplitCard: { flex: 1, backgroundColor: C.card, borderWidth: 1, borderColor: C.line, borderRadius: 16, padding: 13, ...shadow },
+  paymentSplitIconBadge: { width: 30, height: 30, borderRadius: 10, alignItems: 'center', justifyContent: 'center', marginBottom: 9 },
+  paymentSplitIconBadgeApp: { backgroundColor: '#E7F3F0' },
+  paymentSplitIconBadgeDirect: { backgroundColor: '#FBEFEC' },
+  paymentSplitLabel: { color: C.muted, fontSize: 10, fontWeight: '500', marginBottom: 4 },
+  paymentSplitAmount: { color: C.ink, fontSize: 14 , fontWeight: '800', fontVariant: ['tabular-nums'] },
+  paymentSplitSub: { fontSize: 9, fontWeight: '600', marginTop: 4 },
+  paymentSplitSubApp: { color: C.teal },
+  paymentSplitSubDirect: { color: C.brand },
   transactionRow: { flexDirection: 'row', alignItems: 'center', gap: 11, minHeight: 58, borderBottomWidth: 1, borderBottomColor: C.line },
   transactionIcon: { width: 38, height: 38, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
   transactionInfo: { flex: 1 },
@@ -2220,6 +2288,7 @@ const styles = StyleSheet.create({
   jobInfo: { flex: 1 },
   jobService: { color: C.ink, fontWeight: '800', fontSize: 13.5 },
   jobCustomer: { color: C.muted, fontSize: 10.5, marginTop: 2 },
+  suggestedForMeText: { color: C.teal, fontWeight: '700', fontSize: 10.5, marginTop: 3 },
   jobBadge: { borderRadius: 20, paddingVertical: 5, paddingHorizontal: 8, maxWidth: 80 },
   jobBadgeText: { fontSize: 8.5, fontWeight: '800', textTransform: 'uppercase', textAlign: 'center' },
   jobBadge_upcoming: { backgroundColor: '#E9EDFB' },
@@ -2255,7 +2324,7 @@ const styles = StyleSheet.create({
   settlementDescription: { color: C.muted, fontSize: 9.5, lineHeight: 13, marginTop: 2 },
   settlementFoot: { flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between', gap: 10, marginTop: 9 },
   settlementHint: { color: C.muted, fontSize: 9, flex: 1 },
-  settlementNote: { fontSize: 10, lineHeight: 12, fontWeight: '800', maxWidth: 92 },
+  settlementNote: { fontSize: 10, lineHeight: 12, fontWeight: '800', maxWidth: 110, textAlign: 'right' },
   settlementPositive: { color: C.teal },
   settlementWarning: { color: '#B70000' },
   bottomNav: { backgroundColor: C.card, borderTopWidth: 1, borderTopColor: C.line, minHeight: 62, paddingTop: 9, paddingBottom: 5, flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-around' },
@@ -2272,7 +2341,7 @@ const styles = StyleSheet.create({
   postJobTitle: { color: C.ink, fontSize: 17, fontWeight: '800', marginBottom: 6 },
   modalLabel: { color: C.muted, fontSize: 11, fontWeight: '600' },
   modalInputLabel: { marginTop: 14, marginBottom: 7 },
-  modalInput: { height: 46, borderWidth: 1, borderColor: C.line, borderRadius: 12, paddingHorizontal: 13, fontSize: 13, color: C.ink, backgroundColor: C.cream, outlineWidth: 0 },
+  modalInput: { height: 46, borderWidth: 1, borderColor: C.line, borderRadius: 12, paddingHorizontal: 13, fontSize: 13, color: C.ink, backgroundColor: C.cream, outlineWidth: 1.5, outlineColor: '#D1D5DB', outlineStyle: 'solid' },
   categoryPickerRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   categoryPickerChip: { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 10, borderWidth: 1, borderColor: C.line, backgroundColor: C.cream },
   categoryPickerChipActive: { backgroundColor: C.brand, borderColor: C.brand },

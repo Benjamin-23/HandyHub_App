@@ -1,8 +1,9 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
 import { useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
+import { Text } from '@/components/app-text';
 import { SERVICE_CATEGORY_LABELS } from '@/constants/categories';
 import { C } from '@/constants/handyhub-theme';
 import { useAuth } from '@/hooks/use-auth';
@@ -83,7 +84,7 @@ export function WorkerProfileScreen() {
             signOut();
           }}
           style={styles.headerButton}>
-          <Ionicons color="#FFFFFF" name="log-out-outline" size={16} />
+          <Ionicons color="#FFFFFF" name="log-out-outline" size={20} />
         </Pressable>
       </View>
 
@@ -217,7 +218,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   headerTitle: { color: '#FFFFFF', fontSize: 18, fontWeight: '800' },
-  headerButton: { width: 34, height: 34, borderRadius: 12, backgroundColor: 'rgba(255,255,255,0.1)', alignItems: 'center', justifyContent: 'center' },
+  headerButton: { width: 44, height: 44, borderRadius: 14, backgroundColor: 'rgba(255,255,255,0.1)', alignItems: 'center', justifyContent: 'center' },
   scroll: { paddingHorizontal: 20, paddingTop: 17, paddingBottom: 26 },
   card: { backgroundColor: C.card, borderWidth: 1, borderColor: C.line, borderRadius: 18, padding: 18, marginBottom: 14, alignItems: 'center' },
   avatar: { width: 58, height: 58, borderRadius: 29, backgroundColor: '#FBEFEC', alignItems: 'center', justifyContent: 'center', marginBottom: 10 },

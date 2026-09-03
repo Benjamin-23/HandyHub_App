@@ -1,6 +1,16 @@
 import { supabase } from '@/lib/supabase';
 
-export type NotificationKind = 'new_job' | 'price_changed' | 'job_accepted' | 'job_completed';
+export type NotificationKind =
+  | 'new_job'
+  | 'price_changed'
+  | 'job_accepted'
+  | 'job_completed'
+  | 'schedule_changed'
+  | 'job_rated'
+  | 'referred_customer_job'
+  | 'agent_suggestion'
+  | 'new_offer'
+  | 'offer_declined';
 
 export type AppNotification = {
   id: string;

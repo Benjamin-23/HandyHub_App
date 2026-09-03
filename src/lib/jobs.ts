@@ -1,3 +1,5 @@
+import { decode } from 'base64-arraybuffer';
+
 import { supabase } from '@/lib/supabase';
 
 export type JobStatus = 'open' | 'negotiating' | 'accepted' | 'in_progress' | 'completed' | 'cancelled';
@@ -38,6 +40,14 @@ export type Job = {
   transactionCode?: string;
   // Only ever populated for the customer's own fetch — see fetchWorkerJobs.
   completionCode?: string;
+  // The worker an agent has recommended for this still-open job — a label
+  // only, never an assignment. See suggest_worker_for_job() in schema.sql.
+  suggestedWorkerId?: string;
+  suggestedWorkerName?: string;
+  // Set once the customer attaches a photo of the issue at posting time —
+  // deleted server-side once the job completes/cancels (jobs_cleanup_photo
+  // in schema.sql), so this goes back to undefined at that point too.
+  photoPath?: string;
 };
 
 type JobRow = {
@@ -65,11 +75,15 @@ type JobRow = {
   payment_method: JobPaymentMethod | null;
   transaction_code: string | null;
   completion_code?: string | null;
+  suggested_worker_id: string | null;
+  photo_path: string | null;
   customer?: { name: string } | null;
   worker?: { name: string } | null;
+  suggested_worker?: { name: string } | null;
 };
 
-const NAME_JOINS = 'customer:profiles!jobs_customer_id_fkey(name), worker:profiles!jobs_worker_id_fkey(name)';
+const NAME_JOINS =
+  'customer:profiles!jobs_customer_id_fkey(name), worker:profiles!jobs_worker_id_fkey(name), suggested_worker:profiles!jobs_suggested_worker_id_fkey(name)';
 
 // Includes the completion code — only ever used for the customer's own jobs,
 // since they're the one who reads it out to the worker in person.
@@ -81,9 +95,13 @@ const SELECT_FOR_WORKER = `
   id, customer_id, worker_id, category, service, pay_type, location, scheduled_at,
   schedule_set_by, schedule_confirmed, listed_price, current_offer, offer_by, final_price,
   status, completed_at, created_at, rating, commission, remitted, remitted_at,
-  payment_method, transaction_code,
+  payment_method, transaction_code, suggested_worker_id, photo_path,
   ${NAME_JOINS}
 `;
+
+// Same shape as SELECT_FOR_WORKER (no completion_code) — an agent only ever
+// introduces a worker, they never see the code that proves the job is done.
+const SELECT_FOR_AGENT = SELECT_FOR_WORKER;
 
 function toNumber(value: string | number | null | undefined): number | undefined {
   if (value === null || value === undefined) return undefined;
@@ -118,6 +136,9 @@ function fromRow(row: JobRow): Job {
     paymentMethod: row.payment_method ?? undefined,
     transactionCode: row.transaction_code ?? undefined,
     completionCode: row.completion_code ?? undefined,
+    suggestedWorkerId: row.suggested_worker_id ?? undefined,
+    suggestedWorkerName: row.suggested_worker?.name,
+    photoPath: row.photo_path ?? undefined,
   };
 }
 
@@ -154,6 +175,12 @@ export async function postJob(params: {
   // goes straight to them, in "negotiating" so it's immediately their turn
   // to accept or counter. Omit to post it open to any matching worker.
   workerId?: string;
+  // A photo of the issue — optional. Uploaded after the job row exists
+  // (its id is the storage path), so this happens as a second step; see
+  // job-photos bucket policies in schema.sql. Resize/compress client-side
+  // before calling this (see PhotoPicker) so the upload stays small.
+  photoBase64?: string;
+  photoExtension?: 'jpg' | 'png';
 }): Promise<Job> {
   const { data, error } = await supabase
     .from('jobs')
@@ -173,23 +200,34 @@ export async function postJob(params: {
     .select(SELECT_FOR_WORKER)
     .single();
   if (error) throw error;
-  return fromRow(data as unknown as JobRow);
+  let job = fromRow(data as unknown as JobRow);
+
+  if (params.photoBase64) {
+    const extension = params.photoExtension ?? 'jpg';
+    const path = `${job.id}/photo.${extension}`;
+    const contentType = extension === 'png' ? 'image/png' : 'image/jpeg';
+    const { error: uploadError } = await supabase.storage
+      .from('job-photos')
+      .upload(path, decode(params.photoBase64), { contentType, upsert: true });
+    if (uploadError) throw uploadError;
+    const { data: updated, error: patchError } = await supabase
+      .from('jobs')
+      .update({ photo_path: path })
+      .eq('id', job.id)
+      .select(SELECT_FOR_WORKER)
+      .single();
+    if (patchError) throw patchError;
+    job = fromRow(updated as unknown as JobRow);
+  }
+
+  return job;
 }
 
-// A matching worker claims an open job — either accepting the customer's
-// asking price outright, or opening negotiation with a counter-offer.
-export async function claimJob(jobId: string, workerId: string, counterOffer?: number): Promise<Job> {
-  const patch: Record<string, unknown> = { worker_id: workerId };
-  if (counterOffer !== undefined) {
-    patch.current_offer = counterOffer;
-    patch.offer_by = 'worker';
-    patch.status = 'negotiating';
-  } else {
-    patch.status = 'accepted';
-  }
-  const { data, error } = await supabase.from('jobs').update(patch).eq('id', jobId).select(SELECT_FOR_WORKER).single();
+// Bucket is private — a signed URL is needed to actually display the photo.
+export async function fetchJobPhotoUrl(photoPath: string): Promise<string> {
+  const { data, error } = await supabase.storage.from('job-photos').createSignedUrl(photoPath, 3600);
   if (error) throw error;
-  return fromRow(data as unknown as JobRow);
+  return data.signedUrl;
 }
 
 // Either side proposes a new price on an already-claimed job.
@@ -313,6 +351,52 @@ export async function remitJob(jobId: string): Promise<Job> {
   return fromRow(data as unknown as JobRow);
 }
 
+// Every job belonging to this agent's referred/assigned customers — RLS
+// (jobs_select_agent_customers) already limits rows to those. Covers every
+// status so the agent can track a job from open through completed.
+export async function fetchAgentCustomerJobs(): Promise<Job[]> {
+  const { data, error } = await supabase
+    .from('jobs')
+    .select(SELECT_FOR_AGENT)
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return (data as unknown as JobRow[]).map(fromRow);
+}
+
+// Sends the customer a notification suggesting this worker — the agent never
+// touches the job itself (see suggest_worker_for_job() in schema.sql, which
+// only inserts a notification and checks the caller is this customer's agent).
+export async function suggestWorkerForJob(jobId: string, workerId: string): Promise<void> {
+  const { error } = await supabase.rpc('suggest_worker_for_job', { p_job_id: jobId, p_worker_id: workerId });
+  if (error) throw error;
+}
+
+// An agent posts a job directly for one of their referred/assigned
+// customers — same open-marketplace flow as if the customer posted it
+// themselves; see create_job_for_customer() in schema.sql, which checks the
+// caller is actually that customer's agent before inserting anything.
+export async function createJobForCustomer(params: {
+  customerId: string;
+  category: string;
+  service: string;
+  payType: JobPayType;
+  offer: number;
+  location?: string;
+  scheduledAt?: string;
+}): Promise<Job> {
+  const { data, error } = await supabase.rpc('create_job_for_customer', {
+    p_customer_id: params.customerId,
+    p_category: params.category,
+    p_service: params.service,
+    p_pay_type: params.payType,
+    p_offer: params.offer,
+    p_location: params.location,
+    p_scheduled_at: params.scheduledAt,
+  });
+  if (error) throw error;
+  return fromRow(data as unknown as JobRow);
+}
+
 export type RatingSummary = { average: number; count: number };
 
 // A worker can already read their own jobs (RLS: worker_id = auth.uid()), so
@@ -328,4 +412,102 @@ export async function fetchWorkerRatingSummary(workerId: string): Promise<Rating
   if (ratings.length === 0) return { average: 0, count: 0 };
   const average = ratings.reduce((sum, value) => sum + value, 0) / ratings.length;
   return { average, count: ratings.length };
+}
+
+// Open-marketplace negotiation: unlike a direct booking (which negotiates
+// straight on the jobs row via claimJob/counterOffer/acceptOffer above),
+// an open job can have several workers negotiating it at once, each in
+// their own job_offers thread — the job itself stays 'open' until the
+// customer picks one via acceptJobOffer.
+export type JobOfferStatus = 'active' | 'accepted' | 'declined';
+
+export type JobOffer = {
+  id: string;
+  jobId: string;
+  workerId: string;
+  currentOffer: number;
+  offerBy: JobOfferBy;
+  status: JobOfferStatus;
+  createdAt: string;
+  workerName?: string;
+};
+
+type JobOfferRow = {
+  id: string;
+  job_id: string;
+  worker_id: string;
+  current_offer: string | number;
+  offer_by: JobOfferBy;
+  status: JobOfferStatus;
+  created_at: string;
+  worker?: { name: string } | null;
+};
+
+function offerFromRow(row: JobOfferRow): JobOffer {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    workerId: row.worker_id,
+    currentOffer: Number(row.current_offer),
+    offerBy: row.offer_by,
+    status: row.status,
+    createdAt: row.created_at,
+    workerName: row.worker?.name,
+  };
+}
+
+// A worker opens a negotiation thread on a still-open job — their own
+// initial asking price (can simply be the listed price, if they're happy
+// to take it as posted; the customer still has to pick them either way).
+export async function submitJobOffer(jobId: string, workerId: string, amount: number): Promise<JobOffer> {
+  const { data, error } = await supabase
+    .from('job_offers')
+    .insert({ job_id: jobId, worker_id: workerId, current_offer: amount, offer_by: 'worker' })
+    .select('*')
+    .single();
+  if (error) throw error;
+  return offerFromRow(data as unknown as JobOfferRow);
+}
+
+// Either side (customer or the offering worker) counters within one thread.
+export async function counterJobOffer(offerId: string, amount: number, by: JobOfferBy): Promise<JobOffer> {
+  const { data, error } = await supabase
+    .from('job_offers')
+    .update({ current_offer: amount, offer_by: by })
+    .eq('id', offerId)
+    .select('*')
+    .single();
+  if (error) throw error;
+  return offerFromRow(data as unknown as JobOfferRow);
+}
+
+// Customer picks one negotiating worker — matches the job to them and
+// declines every other active thread on it (see accept_job_offer() in
+// schema.sql, which also notifies the declined workers).
+export async function acceptJobOffer(offerId: string): Promise<Job> {
+  const { data, error } = await supabase.rpc('accept_job_offer', { p_offer_id: offerId });
+  if (error) throw error;
+  return fromRow(data as unknown as JobRow);
+}
+
+// A worker's own pending offers, across every open job they've quoted on —
+// merged client-side onto the open jobs fetchWorkerJobs() already returns.
+export async function fetchMyJobOffers(): Promise<JobOffer[]> {
+  const { data, error } = await supabase.from('job_offers').select('*').eq('status', 'active');
+  if (error) throw error;
+  return (data as unknown as JobOfferRow[]).map(offerFromRow);
+}
+
+// Every active offer on a set of the customer's own open jobs, so they can
+// see and pick between everyone currently negotiating each one.
+export async function fetchJobOffers(jobIds: string[]): Promise<JobOffer[]> {
+  if (jobIds.length === 0) return [];
+  const { data, error } = await supabase
+    .from('job_offers')
+    .select('*, worker:profiles!job_offers_worker_id_fkey(name)')
+    .in('job_id', jobIds)
+    .eq('status', 'active')
+    .order('created_at', { ascending: true });
+  if (error) throw error;
+  return (data as unknown as JobOfferRow[]).map(offerFromRow);
 }
